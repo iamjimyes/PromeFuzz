@@ -157,7 +157,7 @@ class Scheduler:
 
     # a useful place holder function
     PLACEHOLDER_FUNCTION = APIFunction(
-        "placeholder", "placeholder", "placeholder", "placeholder"
+        "placeholder", "placeholder", "placeholder", "placeholder", "placeholder"
     )
 
     # If scheduled STAGNATION_THRESHOLD times, there are still no new functions tested, the scheduler will stop

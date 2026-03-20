@@ -37,7 +37,7 @@ class GenRequirements(ABC):
 
         :param headers: The headers list, each element is a header file path
         """
-        header_names = [Path(header).name for header in headers]
+        header_names = headers.copy()
         header_names += [
             Path(header).name for header in global_vars.library_config["driver_headers"]
         ]
@@ -355,7 +355,7 @@ class CInfoCollector(InfoCollector):
             function_requirements=function_requirements,
             type_definitions=type_definitions,
             typedef_definitions=typedef_definitions,
-            headers=function_set.header_paths,
+            headers=function_set.relative_header_paths,
             api_order=api_order,
         )
 
@@ -527,7 +527,7 @@ class CppInfoCollector(InfoCollector):
             type_definitions=type_definitions,
             typedef_definitions=typedef_definitions,
             constructor_signatures=constructor_signatures,
-            headers=function_set.header_paths,
+            headers=function_set.relative_header_paths,
             api_order=api_order,
         )
 

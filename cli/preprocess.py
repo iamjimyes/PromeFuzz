@@ -117,7 +117,7 @@ def preprocess(
     # dump source files and header files into json
     # They are used to determine whether a file in the backtrace is from the library
     # or not in later analysis process
-    source_paths = ast_preprocessor.source_files + api_extractor.header_files
+    source_paths = ast_preprocessor.source_files + list(api_extractor.header_files.keys())
     with open(out_path / "sources.json", "w") as f:
         json.dump([str(_) for _ in source_paths], f, indent=4)
     logger.success(f"Source files dumped to {out_path / 'sources.json'}")

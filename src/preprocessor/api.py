@@ -40,6 +40,13 @@ class APIFunction:
     The declaration location (in the header) of the API function.
     """
 
+    header_root: str
+    """
+    The root directory of the header file.
+    For example, if the header is "opencv/latest/code/include/opencv2/header.h", and the library header root is "opencv/latest/code/include",
+    then the header root is "opencv/latest/code/include".
+    """
+
     def __eq__(self, other):
         if not isinstance(other, APIFunction):
             return False
@@ -83,6 +90,29 @@ class APICollection:
         :return: A list of header paths
         """
         return list(set(func.header for func in self.funcs))
+
+    @property
+    def header_root_paths(self):
+        """
+        Get all header root paths in the API functions
+
+        :return: A list of header root paths
+        """
+        return list(set(func.header_root for func in self.funcs))
+    
+    @property
+    def relative_header_paths(self):
+        """
+        Get all relative header paths in the API functions
+
+        :return: A list of relative header paths
+        """
+        return list(
+            set(
+                str(Path(func.header).relative_to(func.header_root))
+                for func in self.funcs
+            )
+        )
 
     @property
     def function_names(self):
@@ -316,26 +346,30 @@ class APIExtractor:
         :param exclude_paths: List of paths to exclude
         """
         HEADER_SUFFIXES = [".h", ".hpp", ".hxx", ".hh"]
-        header_files: list[Path] = []
+        header_files: dict[Path, Path] = {} # header file path -> header root path
 
         for header_path in header_paths:
             if header_path.is_file():
-                header_files.append(header_path)
+                header_files[header_path.resolve()] = header_path.parent.resolve()
             elif header_path.is_dir():
                 for suffix in HEADER_SUFFIXES:
-                    header_files.extend(header_path.rglob(f"*{suffix}"))
+                    for file in header_path.rglob(f"*{suffix}"):
+                        if file.is_file():
+                            header_files[file.resolve()] = header_path.resolve()
             else:
                 logger.warning(f"Invalid header path {header_path}")
 
         # filter out the excluded paths
-        header_files = [
-            file for file in header_files if not path_in_paths(file, exclude_paths)
-        ]
+        deletion = []
+        for file in header_files.keys():
+            if path_in_paths(file, exclude_paths):
+                deletion.append(file)
+        for file in deletion:
+            del header_files[file]
 
         logger.debug(
-            f"Found {len(header_files)} header files: {[str(file) for file in header_files]}"
+            f"Found {len(header_files)} header files: {[str(file) for file in header_files.keys()]}"
         )
-        header_files = [file.resolve() for file in header_files]
         self.header_files = header_files
 
     def _extract_functions(self) -> APICollection:
@@ -358,7 +392,7 @@ class APIExtractor:
             )
 
             # check if any of the function locations is in the header files
-            for header_file in self.header_files:
+            for header_file, header_root in self.header_files.items():
                 if def_file == header_file or decl_file == header_file:
                     api_func = APIFunction(
                         header=str(header_file),
@@ -367,6 +401,7 @@ class APIExtractor:
                         decl_loc=str(
                             func_loc if def_file == header_file else func_obj["declLoc"]
                         ),
+                        header_root=str(header_root),
                     )
                     api_functions.append(api_func)
                     break

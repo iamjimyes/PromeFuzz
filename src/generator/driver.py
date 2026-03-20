@@ -83,7 +83,7 @@ class FuzzDriver:
         """
         # get all header paths in target functions
         header_paths = set(
-            Path(p).resolve().parent for p in self.function_set.header_paths
+            Path(p).resolve() for p in self.function_set.header_root_paths
         )
         header_paths.update(
             Path(header).resolve().parent
