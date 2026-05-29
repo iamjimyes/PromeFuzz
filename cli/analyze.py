@@ -32,6 +32,27 @@ class TaskOption(StrEnum):
     ALL = auto()
 
 
+def classify_analysis_verdict(analysis_report: str) -> str:
+    """
+    Parse structured verdict fields from an analysis report.
+    """
+    verdict_match = re.search(r"^Verdict:\s*(.+)$", analysis_report, flags=re.MULTILINE)
+    if verdict_match:
+        verdict = verdict_match.group(1).strip().lower().replace(" ", "_")
+        verdict_map = {
+            "bug_in_library": "TP",
+            "misuse_in_fuzz_driver": "FP",
+            "unknown": "UN",
+        }
+        return verdict_map.get(verdict, "UN")
+
+    pattern = r"The crash is a .*(Misuse in fuzz driver|Bug in library).* below is the explanation"
+    if re.search(pattern, analysis_report):
+        crash_type = re.search(pattern, analysis_report).group(1)
+        return "TP" if crash_type == "Bug in library" else "FP"
+    return "UN"
+
+
 @click.command(help="Analyzes the crash and generates a report.")
 @click.option(
     "-L",
@@ -132,19 +153,9 @@ def analyze(
         for filename, err_sig, analysis_report in zip(
             valid_filenames, err_signatures, analysis_reports
         ):
-            # LLM output example:
-            # The crash is a Misuse in fuzz driver / Bug in library, below is the explanation.
-            pattern = r"The crash is a .*(Misuse in fuzz driver|Bug in library).* below is the explanation"
-            if re.search(pattern, analysis_report):
-                crash_type = re.search(pattern, analysis_report).group(1)
-                if crash_type == "Bug in library":
-                    crash_type = "TP"
-                    TP_crash_signatures.append(err_sig)
-                elif crash_type == "Misuse in fuzz driver":
-                    crash_type = "FP"
-                    logger.debug(f"Detected crash type: {crash_type}")
-            else:
-                crash_type = "UN"
+            crash_type = classify_analysis_verdict(analysis_report)
+            if crash_type == "TP":
+                TP_crash_signatures.append(err_sig)
             logger.debug(f"Detected crash type: {crash_type}")
             output_file = (
                 output_path / f"{crash_type}-{err_sig.replace('/', '_')}-{filename}.md"

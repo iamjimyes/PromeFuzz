@@ -41,6 +41,13 @@ class CrashLogClassifier:
                     "summary": f"Runtime setup failed around: {pattern}",
                 }
 
+        if "program timed off" in lower or "timed out" in lower:
+            return {
+                "kind": "unknown",
+                "signature": "timeout@unknown",
+                "summary": "The deterministic replay timed out before it reached a parsed target crash signature.",
+            }
+
         signal_match = self.SIGNAL_RE.search(log_text)
         tombstone_match = self.TOMBSTONE_RE.search(log_text)
         if signal_match or tombstone_match:

@@ -1,0 +1,54 @@
+{
+  "name": "xhs_caseinj_reif",
+  "ssh_target": "psy@10.176.46.32",
+  "container_name": "mycontainer-bigemu",
+  "device_serial": "emulator-5562",
+  "host_work_root": "/home/psy/droidot",
+  "container_work_root": "/mnt",
+  "host_harness_dir": "/home/psy/droidot/target_APK/com.xingin.xhs.caseinj/harnesses/Java_com_xingin_xhs_xyreif_ReifDecoder_jniReifStartDecode@@0",
+  "host_libharness_path": "/home/psy/droidot/harness/cpp/libharness.so",
+  "host_app_root": "/home/psy/droidot/target_APK/com.xingin.xhs.caseinj",
+  "host_afl_dir": "/home/psy/droidot/afl",
+  "host_frida_script": "/home/psy/droidot/target_APK/com.xingin.xhs.caseinj/harnesses/Java_com_xingin_xhs_xyreif_ReifDecoder_jniReifStartDecode@@0/afl.js",
+  "host_seed_dir": "/home/psy/droidot/target_APK/com.xingin.xhs.caseinj/harnesses/Java_com_xingin_xhs_xyreif_ReifDecoder_jniReifStartDecode@@0/seeds",
+  "host_runtime_libcpp_path": "/home/psy/droidot/target_APK/com.apple.atve.androidtv.appletv/lib/arm64-v8a/libc++_shared.so",
+  "host_runtime_overrides_env_path": "/home/psy/droidot/target_APK/com.xingin.xhs.caseinj/harnesses/Java_com_xingin_xhs_xyreif_ReifDecoder_jniReifStartDecode@@0/runtime_overrides.env",
+  "host_repair_root": "/home/psy/droidot/promefuzz_repair_staging",
+  "host_extra_stage_files": [
+    {
+      "host_path": "/home/psy/droidot/target_APK/com.xingin.xhs.caseinj/reif_min_class_shim.jar",
+      "device_relative_path": "aux/reif_min_class_shim.jar",
+      "chmod": "644"
+    }
+  ],
+  "device_runtime_root": "/data/local/tmp/promefuzz-bigemu/sessions/xhs_caseinj_reif",
+  "device_app_root": "/data/local/tmp/promefuzz-bigemu/apps/com.xingin.xhs.caseinj",
+  "target_library_basename": "libxyreif.so",
+  "class0": "com/xingin/xhs/xyreif/ReifDecoder",
+  "afl_binary_path": "/data/local/tmp/promefuzz-bigemu/runtime/afl/afl-fuzz",
+  "afl_showmap_path": "/data/local/tmp/promefuzz-bigemu/runtime/afl/afl-showmap",
+  "seconds": 20,
+  "cmplog": true,
+  "afl_timeout_ms": 5000,
+  "forkserver_init_timeout_ms": 90000,
+  "results_dir_name": "output_fg",
+  "harness_binary_name": "harness",
+  "seed_subdir": "seeds",
+  "synthetic_seed_name": "seed-empty",
+  "remote_compile_dir": "/data/local/tmp/promefuzz-bigemu/build",
+  "androlib_memory_name": "memory",
+  "afl_preload_paths": [
+    "/data/data/com.termux/files/usr/lib/libc++_shared.so",
+    "/data/local/tmp/promefuzz-bigemu/apps/com.xingin.xhs.caseinj/lib/arm64-v8a/libc++_shared.so"
+  ],
+  "extra_env": {},
+  "droidot_allow_null_caller": false,
+  "droidot_skip_target_call": false,
+  "droidot_mask_target_crash": false,
+  "droidot_class_apk": "",
+  "repair_target_files": [
+    "harness.cpp",
+    "runtime_overrides.env"
+  ],
+  "local_results_root": "android_runs/promefuzz-bigemu"
+}

@@ -168,8 +168,8 @@ enable_log = true
 # [MODIFY THIS] Your custom llm name.
 [llm.cloud_llm]
 
-# The llm type, currently support "ollama", "openai", "ollama-reasoning", "openai-reasoning"
-llm_type = "openai"
+# The llm type, currently support "ollama", "openai", "ollama-reasoning", "openai-reasoning", "codex-process", "codex-process-reasoning"
+llm_type = "codex-process-reasoning"
 
 # The base url for the openai api.
 base_url = "https://api.openai.com/v1/"
@@ -178,10 +178,10 @@ base_url = "https://api.openai.com/v1/"
 api_key = ""
 
 # The model used for the llm query.
-model = "gpt-4o"
+model = "gpt-5.3-codex"
 
 # The temperature for the llm query. Recommend to set it lower for generating code.
-temperature = 0.5
+temperature = 0.2
 
 # The token limit for each llm query. Set it to -1 for the preset limit from model provider.
 max_tokens = -1
@@ -191,6 +191,27 @@ timeout = 80
 
 # The maximum retry times for each query.
 retry_times = 3
+
+# The executable used to launch the Codex agent/CLI process.
+codex_executable = "codex"
+
+# The argument template list for the Codex process invocation.
+# The following placeholders are supported:
+# {MODEL} {TASK_DIR} {TASK_FILE} {RESULT_JSON} {RESULT_TXT} {REQUEST_JSON} {MESSAGES_JSON}
+# {SCHEMA_JSON} {SANDBOX_MODE} {APPROVAL_MODE} {VERBOSITY} {REASONING_EFFORT}
+# For the real Codex CLI, pass "-" to feed the rendered task through stdin.
+codex_args = ["exec", "--model", "{MODEL}", "--sandbox", "{SANDBOX_MODE}", "--output-schema", "{SCHEMA_JSON}", "-o", "{RESULT_TXT}", "-"]
+
+# The root directory to store Codex task directories.
+work_root = "logs/codex_tasks"
+
+# Codex process execution modes.
+sandbox_mode = "workspace-write"
+approval_mode = "never"
+verbosity = "medium"
+reasoning_effort = "medium"
+capture_stdout = true
+keep_task_dirs = true
 
 # ------------- Configuration for LLM 2 (Local LLM) -------------
 

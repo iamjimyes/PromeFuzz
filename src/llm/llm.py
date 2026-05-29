@@ -2,18 +2,31 @@
 A wrapper for the OpenAI API and Ollama API
 """
 
-from openai import OpenAI
-from ollama import Client as Ollama
-from loguru import logger
-from enum import Enum
-from abc import ABC, abstractmethod
-import threading
-import tiktoken
-import time
 import atexit
+import json
+import os
+import shutil
+import subprocess
 import sys
-from typing import Union
-from dataclasses import dataclass
+import threading
+import time
+from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any, Union
+from uuid import uuid4
+
+import tiktoken
+from loguru import logger
+try:
+    from ollama import Client as Ollama
+except ImportError:
+    Ollama = None
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 from src import vars as global_vars
 
@@ -23,6 +36,8 @@ class LLM_TYPES(Enum):
     OPENAI = "openai"
     OLLAMA_REASONING = "ollama-reasoning"
     OPENAI_REASONING = "openai-reasoning"
+    CODEX_PROCESS = "codex-process"
+    CODEX_PROCESS_REASONING = "codex-process-reasoning"
 
 
 @dataclass
@@ -57,6 +72,119 @@ class QueryStats:
         Create an empty QueryStats
         """
         return cls(0, {}, {}, (0, 0))
+
+
+@dataclass
+class ExecTaskFile:
+    """
+    One structured input file for an execution-style task.
+    """
+
+    path: str
+    content: str
+
+
+@dataclass
+class ExecTaskSpec:
+    """
+    Structured execution contract for Codex process runs.
+    """
+
+    task_kind: str
+    role: str
+    objective: str
+    rules: list[str]
+    output_contract: dict
+    input_files: list[ExecTaskFile] = field(default_factory=list)
+    result_mode: str = "json"
+    history_summary: str = ""
+
+    def render_task_markdown(self) -> str:
+        """
+        Render the execution task into a stable markdown contract.
+        """
+        input_file_lines = "\n".join(
+            f"- `{task_file.path}`" for task_file in self.input_files
+        )
+        rules_text = "\n".join(f"- {rule}" for rule in self.rules)
+        history_text = (
+            f"\n## HISTORY SUMMARY\n\n{self.history_summary}\n"
+            if self.history_summary
+            else ""
+        )
+        return "\n".join(
+            [
+                "# ROLE",
+                "",
+                self.role,
+                "",
+                "# OBJECTIVE",
+                "",
+                self.objective,
+                "",
+                "# INPUT FILES",
+                "",
+                input_file_lines if input_file_lines else "- None",
+                history_text,
+                "# RULES",
+                "",
+                rules_text if rules_text else "- None",
+                "",
+                "# OUTPUT CONTRACT",
+                "",
+                "Write the final result exactly according to this JSON contract:"
+                if self.result_mode == "json"
+                else "Write the final result as plain text only:",
+                "",
+                (
+                    "```json\n"
+                    + json.dumps(self.output_contract, indent=2, ensure_ascii=True)
+                    + "\n```"
+                )
+                if self.result_mode == "json"
+                else self.output_contract.get("description", ""),
+                "",
+                "# WRITE RESULT",
+                "",
+                (
+                    "Return the final result as your last message only, exactly matching the JSON contract above. "
+                    "The caller captures that final message into `outputs/result.txt`."
+                    if self.result_mode == "json"
+                    else "Return the final result as your last message only. The caller captures it into `outputs/result.txt`."
+                ),
+            ]
+        ).strip()
+
+    def as_logging_prompt(self) -> str:
+        """
+        A stable user-visible representation for query logging.
+        """
+        return self.render_task_markdown()
+
+
+def _infer_json_schema(sample: Any) -> dict:
+    """
+    Infer a minimal JSON schema from a sample contract object.
+    """
+    if isinstance(sample, dict):
+        return {
+            "type": "object",
+            "properties": {key: _infer_json_schema(value) for key, value in sample.items()},
+            "required": list(sample.keys()),
+            "additionalProperties": False,
+        }
+    if isinstance(sample, list):
+        item_schema = _infer_json_schema(sample[0]) if sample else {}
+        return {"type": "array", "items": item_schema}
+    if isinstance(sample, bool):
+        return {"type": "boolean"}
+    if isinstance(sample, int):
+        return {"type": "integer"}
+    if isinstance(sample, float):
+        return {"type": "number"}
+    if sample is None:
+        return {"type": "null"}
+    return {"type": "string"}
 
 
 class QueryLogger:
@@ -116,6 +244,7 @@ class QueryLogger:
         """
         with self.lock:
             if not hasattr(self, "log_file"):
+                (global_vars.promefuzz_path / "logs").mkdir(parents=True, exist_ok=True)
                 self.log_file = open(
                     global_vars.promefuzz_path / "logs" / "llm.log", "a"
                 )
@@ -242,18 +371,24 @@ class QueryLogger:
 
             # invoke the function
             # set `return_tokens` to True to log the tokens
-            ret = func(self, arg_messages, True)
+            ret = func(self, arg_messages, True, **kwargs)
             if ret is None:
                 # log the query failed
                 _self._print_log(f"Query {query_id} failed")
                 return None
             else:
                 if is_reasoning_client:
-                    response, reasoning, query_tokens, response_tokens = ret
+                    if len(ret) == 5:
+                        response, reasoning, query_tokens, response_tokens, _ = ret
+                    else:
+                        response, reasoning, query_tokens, response_tokens = ret
                     # log reasoning
                     _self.log_reasoning(query_id, reasoning)
                 else:
-                    response, query_tokens, response_tokens = ret
+                    if len(ret) == 4:
+                        response, query_tokens, response_tokens, _ = ret
+                    else:
+                        response, query_tokens, response_tokens = ret
 
             # log response
             _self.log_response(query_id, response)
@@ -277,17 +412,20 @@ class LLMClient(ABC):
 
     # whether to enable the query logger
     ENABLE_LOG = True
+    SUPPORTS_EXEC_TASKS = False
 
     query_logger: QueryLogger = QueryLogger()
 
     @abstractmethod
     def __init__(self):
-        if not self.ENABLE_LOG:
-            self.query_logger.enable_log = False
+        self.query_logger.enable_log = self.ENABLE_LOG
 
     @abstractmethod
     def query_with_messages(
-        self, messages: list[dict[str, str]], return_tokens: bool = False
+        self,
+        messages: list[dict[str, str]],
+        return_tokens: bool = False,
+        **kwargs,
     ) -> Union[str, tuple[str, int, int], None]:
         """
         Query with messages list
@@ -297,6 +435,39 @@ class LLMClient(ABC):
         :return: Response text, or tuple of response text and tokens, or None if the query failed
         """
         ...
+
+    @staticmethod
+    def stringify_exec_result(raw_result: dict) -> str:
+        """
+        Convert a structured execution result into the assistant text stored in chat history.
+        """
+        kind = raw_result.get("kind", "")
+        if kind == "code_file":
+            return raw_result.get("code", "")
+        if kind == "json_array_indexes":
+            return json.dumps(raw_result.get("indexes", []))
+        if kind == "plain_summary":
+            return raw_result.get("text", "")
+        if kind == "analysis_verdict":
+            verdict = raw_result.get("verdict", "unknown")
+            verdict_map = {
+                "bug_in_library": "Bug in library",
+                "misuse_in_fuzz_driver": "Misuse in fuzz driver",
+                "unknown": "Unknown",
+            }
+            return "Verdict: {}\nExplanation:\n{}".format(
+                verdict_map.get(verdict, verdict),
+                raw_result.get("explanation", ""),
+            ).strip()
+        if kind == "constraints_and_code":
+            return raw_result.get("code", "")
+        if kind == "droidot_repair":
+            return "Verdict: {}\nTarget File: {}\nRoot Cause:\n{}".format(
+                raw_result.get("verdict", "unknown"),
+                raw_result.get("target_file", ""),
+                raw_result.get("root_cause", ""),
+            ).strip()
+        return raw_result.get("text", json.dumps(raw_result))
 
     def query_once(self, user_prompt: str, system_prompt: str = "") -> str:
         """
@@ -366,7 +537,10 @@ class ReasoningLLMClient(LLMClient):
 
     @abstractmethod
     def query_with_messages(
-        self, messages: list[dict[str, str]], return_tokens: bool = False
+        self,
+        messages: list[dict[str, str]],
+        return_tokens: bool = False,
+        **kwargs,
     ) -> Union[tuple[str, str], tuple[str, str, int, int], None]:
         """
         Query with messages list
@@ -417,6 +591,8 @@ class OpenAIClient(LLMClient):
         :param retry_times: Number of times to retry the API requests, default is 3
         """
         try:
+            if OpenAI is None:
+                raise ImportError("openai package is not installed")
             self.client = OpenAI(
                 api_key=api_key,
                 base_url=base_url,
@@ -435,7 +611,10 @@ class OpenAIClient(LLMClient):
     @LLMClient.with_retry
     @LLMClient.query_logger.with_log
     def query_with_messages(
-        self, messages: list[dict[str, str]], return_tokens: bool = False
+        self,
+        messages: list[dict[str, str]],
+        return_tokens: bool = False,
+        **kwargs,
     ) -> Union[str, tuple[str, int, int], None]:
         """
         Query with messages list
@@ -502,6 +681,8 @@ class OllamaClient(LLMClient):
         :param timeout: The timeout seconds for each query
         :param retry_times: Number of times to retry the query
         """
+        if Ollama is None:
+            raise ValueError("ollama package is not installed")
         self.client = Ollama(f"{host}:{port}", timeout=timeout)
         self.model = model
         self.max_tokens = max_tokens
@@ -512,7 +693,10 @@ class OllamaClient(LLMClient):
     @LLMClient.with_retry
     @LLMClient.query_logger.with_log
     def query_with_messages(
-        self, messages: list[dict[str, str]], return_tokens: bool = False
+        self,
+        messages: list[dict[str, str]],
+        return_tokens: bool = False,
+        **kwargs,
     ) -> Union[str, tuple[str, int, int], None]:
         """
         Query with messages list
@@ -579,6 +763,8 @@ class OpenAIReasoningClient(ReasoningLLMClient):
         :param retry_times: Number of times to retry the API requests, default is 3
         """
         try:
+            if OpenAI is None:
+                raise ImportError("openai package is not installed")
             self.client = OpenAI(
                 api_key=api_key,
                 base_url=base_url,
@@ -597,7 +783,10 @@ class OpenAIReasoningClient(ReasoningLLMClient):
     @LLMClient.with_retry
     @LLMClient.query_logger.with_log
     def query_with_messages(
-        self, messages: list[dict[str, str]], return_tokens: bool = False
+        self,
+        messages: list[dict[str, str]],
+        return_tokens: bool = False,
+        **kwargs,
     ) -> Union[tuple[str, str], tuple[str, str, int, int], None]:
         """
         Query with messages list
@@ -691,6 +880,8 @@ class OllamaReasoningClient(ReasoningLLMClient):
         :param timeout: The timeout seconds for each query
         :param retry_times: Number of times to retry the query
         """
+        if Ollama is None:
+            raise ValueError("ollama package is not installed")
         self.client = Ollama(f"{host}:{port}", timeout=timeout)
         self.model = model
         self.max_tokens = max_tokens
@@ -701,7 +892,10 @@ class OllamaReasoningClient(ReasoningLLMClient):
     @LLMClient.with_retry
     @LLMClient.query_logger.with_log
     def query_with_messages(
-        self, messages: list[dict[str, str]], return_tokens: bool = False
+        self,
+        messages: list[dict[str, str]],
+        return_tokens: bool = False,
+        **kwargs,
     ) -> Union[tuple[str, str], tuple[str, str, int, int], None]:
         """
         Query with messages list
@@ -743,6 +937,307 @@ class OllamaReasoningClient(ReasoningLLMClient):
                 OllamaClient.count_tokens(messages),
                 OllamaClient.count_tokens(reasoning + response),
             )
+
+
+class CodexProcessClient(LLMClient):
+    """
+    Codex agent/CLI process client.
+    """
+
+    SUPPORTS_EXEC_TASKS = True
+
+    def __init__(
+        self,
+        executable: str,
+        args: list[str] | None,
+        model: str,
+        work_root: str,
+        timeout: int = 600,
+        retry_times: int = 1,
+        sandbox_mode: str = "workspace-write",
+        approval_mode: str = "never",
+        verbosity: str = "medium",
+        reasoning_effort: str = "medium",
+        capture_stdout: bool = True,
+        keep_task_dirs: bool = True,
+    ):
+        self.executable = executable
+        self.args = args or []
+        self.model = model
+        self.work_root = Path(work_root).resolve(strict=False)
+        self.timeout = timeout
+        self.retry_times = retry_times
+        self.sandbox_mode = sandbox_mode
+        self.approval_mode = approval_mode
+        self.verbosity = verbosity
+        self.reasoning_effort = reasoning_effort
+        self.capture_stdout = capture_stdout
+        self.keep_task_dirs = keep_task_dirs
+        super().__init__()
+
+    def _default_exec_task_from_messages(
+        self, messages: list[dict[str, str]]
+    ) -> ExecTaskSpec:
+        return ExecTaskSpec(
+            task_kind="plain_chat",
+            role="You are completing one text task for an existing codebase tool.",
+            objective="Read the provided conversation and write the final answer.",
+            rules=[
+                "Use the conversation as the only source of truth.",
+                "Do not explain your process unless asked.",
+                "Write the final answer to the result file.",
+            ],
+            output_contract={
+                "kind": "plain_summary",
+                "text": "Final plain-text answer.",
+            },
+            input_files=[
+                ExecTaskFile(
+                    "inputs/conversation.json",
+                    json.dumps(messages, indent=2, ensure_ascii=True),
+                )
+            ],
+            history_summary="Messages are also mirrored in inputs/conversation.json.",
+        )
+
+    def _build_command(self, replacements: dict[str, str]) -> list[str]:
+        executable = self.executable
+        if not Path(executable).suffix:
+            resolved = shutil.which(executable)
+            if resolved is None and os.name == "nt":
+                resolved = shutil.which(f"{executable}.cmd")
+            if resolved is not None:
+                executable = resolved
+        return [executable] + [arg.format(**replacements) for arg in self.args]
+
+    def _load_result(
+        self,
+        result_json_path: Path,
+        result_txt_path: Path,
+        stdout_text: str,
+    ) -> dict | None:
+        if result_json_path.exists():
+            try:
+                return json.loads(result_json_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.error(f"Failed to parse Codex result json {result_json_path}: {e}")
+                return None
+        if result_txt_path.exists():
+            text = result_txt_path.read_text(encoding="utf-8").strip()
+            if text:
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    return {
+                        "kind": "plain_summary",
+                        "text": text,
+                    }
+                if isinstance(parsed, dict):
+                    return parsed
+                return {"kind": "plain_summary", "text": text}
+        if stdout_text.strip():
+            return {"kind": "plain_summary", "text": stdout_text.strip()}
+        return None
+
+    def _normalize_result(self, raw_result: dict) -> tuple[str, str]:
+        return self.stringify_exec_result(raw_result), raw_result.get("reasoning", "")
+
+    def _estimate_usage(
+        self, raw_result: dict, messages: list[dict[str, str]], response: str, reasoning: str
+    ) -> tuple[int, int]:
+        usage = raw_result.get("usage", {}) if isinstance(raw_result, dict) else {}
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        if isinstance(input_tokens, int) and isinstance(output_tokens, int):
+            return input_tokens, output_tokens
+        return (
+            OllamaClient.count_tokens(messages),
+            OllamaClient.count_tokens(reasoning + response),
+        )
+
+    def _run_exec_task(
+        self, messages: list[dict[str, str]], exec_task: ExecTaskSpec
+    ) -> tuple[dict, str, str, int, int]:
+        self.work_root.mkdir(parents=True, exist_ok=True)
+        task_dir = self.work_root / (
+            time.strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:8]
+        )
+        inputs_dir = task_dir / "inputs"
+        outputs_dir = task_dir / "outputs"
+        inputs_dir.mkdir(parents=True, exist_ok=True)
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+
+        request_path = task_dir / "request.json"
+        messages_path = task_dir / "messages.json"
+        task_path = task_dir / "task.md"
+        expected_contract_path = outputs_dir / "expected_contract.json"
+        schema_json_path = outputs_dir / "output_schema.json"
+        result_json_path = outputs_dir / "result.json"
+        result_txt_path = outputs_dir / "result.txt"
+        stdout_path = task_dir / "stdout.log"
+        stderr_path = task_dir / "stderr.log"
+        exit_status_path = task_dir / "exit_status.json"
+
+        request_payload = {
+            "task_kind": exec_task.task_kind,
+            "model": self.model,
+            "sandbox_mode": self.sandbox_mode,
+            "approval_mode": self.approval_mode,
+            "verbosity": self.verbosity,
+            "reasoning_effort": self.reasoning_effort,
+            "timeout": self.timeout,
+            "result_mode": exec_task.result_mode,
+        }
+        request_path.write_text(
+            json.dumps(request_payload, indent=2, ensure_ascii=True), encoding="utf-8"
+        )
+        messages_path.write_text(
+            json.dumps(messages, indent=2, ensure_ascii=True), encoding="utf-8"
+        )
+        task_path.write_text(exec_task.render_task_markdown(), encoding="utf-8")
+        expected_contract_path.write_text(
+            json.dumps(exec_task.output_contract, indent=2, ensure_ascii=True),
+            encoding="utf-8",
+        )
+        schema_json_path.write_text(
+            json.dumps(_infer_json_schema(exec_task.output_contract), indent=2, ensure_ascii=True),
+            encoding="utf-8",
+        )
+        for input_file in exec_task.input_files:
+            file_path = task_dir / input_file.path
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(input_file.content, encoding="utf-8")
+
+        replacements = {
+            "TASK_DIR": str(task_dir),
+            "TASK_FILE": str(task_path),
+            "RESULT_JSON": str(result_json_path),
+            "RESULT_TXT": str(result_txt_path),
+            "SCHEMA_JSON": str(schema_json_path),
+            "REQUEST_JSON": str(request_path),
+            "MESSAGES_JSON": str(messages_path),
+            "MODEL": self.model,
+            "SANDBOX_MODE": self.sandbox_mode,
+            "APPROVAL_MODE": self.approval_mode,
+            "VERBOSITY": self.verbosity,
+            "REASONING_EFFORT": self.reasoning_effort,
+        }
+        command = self._build_command(replacements)
+        stdin_payload = exec_task.render_task_markdown() if "-" in self.args else None
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=task_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                input=stdin_payload,
+                timeout=self.timeout,
+                check=False,
+            )
+        except Exception as e:
+            logger.error(f"Codex process execution failed: {e}")
+            return None, "", "", 0, 0
+
+        stdout_path.write_text(completed.stdout or "", encoding="utf-8")
+        stderr_path.write_text(completed.stderr or "", encoding="utf-8")
+        exit_status_path.write_text(
+            json.dumps(
+                {
+                    "returncode": completed.returncode,
+                    "command": command,
+                },
+                indent=2,
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+
+        raw_result = self._load_result(result_json_path, result_txt_path, completed.stdout)
+        if raw_result is None:
+            logger.error(
+                "Codex process did not produce a valid result file. stderr:\n"
+                + (completed.stderr or "")
+            )
+            return None, "", "", 0, 0
+
+        response, reasoning = self._normalize_result(raw_result)
+        query_tokens, response_tokens = self._estimate_usage(
+            raw_result, messages, response, reasoning
+        )
+        return raw_result, response, reasoning, query_tokens, response_tokens
+
+    @LLMClient.with_retry
+    @LLMClient.query_logger.with_log
+    def query_with_messages(
+        self,
+        messages: list[dict[str, str]],
+        return_tokens: bool = False,
+        **kwargs,
+    ) -> Union[str, tuple[str, int, int], tuple[str, int, int, dict], None]:
+        exec_task = kwargs.get("exec_task") or self._default_exec_task_from_messages(
+            messages
+        )
+        raw_result, response, reasoning, query_tokens, response_tokens = (
+            self._run_exec_task(messages, exec_task)
+        )
+        if raw_result is None:
+            return None
+        if not return_tokens:
+            return response
+        return response, query_tokens, response_tokens, raw_result
+
+
+class CodexProcessReasoningClient(ReasoningLLMClient):
+    """
+    Codex agent/CLI process client with reasoning-compatible return type.
+    """
+
+    SUPPORTS_EXEC_TASKS = True
+
+    def __init__(self, *args, **kwargs):
+        self._delegate = CodexProcessClient(*args, **kwargs)
+        self.retry_times = self._delegate.retry_times
+        super().__init__()
+
+    @property
+    def model(self):
+        return self._delegate.model
+
+    @property
+    def work_root(self):
+        return self._delegate.work_root
+
+    def _default_exec_task_from_messages(
+        self, messages: list[dict[str, str]]
+    ) -> ExecTaskSpec:
+        return self._delegate._default_exec_task_from_messages(messages)
+
+    @LLMClient.with_retry
+    @LLMClient.query_logger.with_log
+    def query_with_messages(
+        self,
+        messages: list[dict[str, str]],
+        return_tokens: bool = False,
+        **kwargs,
+    ) -> Union[
+        tuple[str, str],
+        tuple[str, str, int, int],
+        tuple[str, str, int, int, dict],
+        None,
+    ]:
+        exec_task = kwargs.get("exec_task") or self._default_exec_task_from_messages(
+            messages
+        )
+        raw_result, response, reasoning, query_tokens, response_tokens = (
+            self._delegate._run_exec_task(messages, exec_task)
+        )
+        if raw_result is None:
+            return None
+        if not return_tokens:
+            return response, reasoning
+        return response, reasoning, query_tokens, response_tokens, raw_result
 
 
 class LLMChat:
@@ -794,6 +1289,43 @@ class LLMChat:
             return response, reasoning
         else:
             return "", ""
+
+    def query_exec_task_reasoning(
+        self, exec_task: ExecTaskSpec
+    ) -> tuple[dict | None, str]:
+        """
+        Query an execution-style task and return the structured result plus reasoning text.
+        """
+        if not self.client.SUPPORTS_EXEC_TASKS:
+            response, reasoning = self.query_reasoning(exec_task.as_logging_prompt())
+            return {"kind": "plain_summary", "text": response}, reasoning
+
+        messages = self._history + [
+            {"role": "user", "content": exec_task.as_logging_prompt()}
+        ]
+        if isinstance(self.client, ReasoningLLMClient):
+            result = self.client.query_with_messages(messages, True, exec_task=exec_task)
+            if result is None:
+                response, reasoning, raw_result = "", "", None
+            else:
+                response, reasoning, _, _, raw_result = result
+        else:
+            result = self.client.query_with_messages(messages, True, exec_task=exec_task)
+            if result is None:
+                response, reasoning, raw_result = "", "", None
+            else:
+                response, _, _, raw_result = result
+                reasoning = ""
+
+        if response:
+            self._history = messages + [{"role": "assistant", "content": response}]
+        return raw_result, reasoning
+
+    def query_exec_task(self, exec_task: ExecTaskSpec) -> dict | None:
+        """
+        Query an execution-style task and return the structured result only.
+        """
+        return self.query_exec_task_reasoning(exec_task)[0]
 
     def query(self, prompt: str) -> str:
         """

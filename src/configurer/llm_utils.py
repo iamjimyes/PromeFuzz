@@ -112,6 +112,25 @@ def display_llm_details(
         click.echo(f"{indent}  Host: {host}")
         click.echo(f"{indent}  Port: {port}")
         click.echo(f"{indent}  Full URL: http://{host}:{port}")
+    elif llm_type in ["codex-process", "codex-process-reasoning"]:
+        click.echo(f"{indent}")
+        click.echo(f"{indent}Codex Process Configuration:")
+        click.echo(
+            f"{indent}  Executable: {llm_config.get('codex_executable', 'Not set')}"
+        )
+        click.echo(f"{indent}  Work Root: {llm_config.get('work_root', 'Not set')}")
+        click.echo(
+            f"{indent}  Sandbox Mode: {llm_config.get('sandbox_mode', 'workspace-write')}"
+        )
+        click.echo(
+            f"{indent}  Approval Mode: {llm_config.get('approval_mode', 'never')}"
+        )
+        click.echo(
+            f"{indent}  Verbosity: {llm_config.get('verbosity', 'medium')}"
+        )
+        click.echo(
+            f"{indent}  Reasoning Effort: {llm_config.get('reasoning_effort', 'medium')}"
+        )
 
     # Common configuration
     click.echo(f"{indent}")

@@ -185,6 +185,15 @@ def show(config_path: Path, name: str):
 @click.option("--base-url", help="Set base URL (for OpenAI-type LLMs)")
 @click.option("--host", help="Set host (for Ollama-type LLMs)")
 @click.option("--port", type=int, help="Set port (for Ollama-type LLMs)")
+@click.option("--codex-executable", help="Set Codex process executable path")
+@click.option("--work-root", help="Set Codex task work root")
+@click.option("--sandbox-mode", help="Set Codex sandbox mode")
+@click.option("--approval-mode", help="Set Codex approval mode")
+@click.option("--verbosity", help="Set Codex verbosity")
+@click.option("--reasoning-effort", help="Set Codex reasoning effort")
+@click.option("--capture-stdout/--no-capture-stdout", default=None, help="Capture Codex stdout")
+@click.option("--keep-task-dirs/--cleanup-task-dirs", default=None, help="Keep Codex task directories")
+@click.option("--codex-arg", "codex_args", multiple=True, help="Append one Codex CLI argument")
 @click.argument("name", required=True)
 def set(config_path: Path, name: str, **kwargs):
     """Set LLM configuration parameters.
@@ -210,6 +219,8 @@ def set(config_path: Path, name: str, **kwargs):
     for param, value in kwargs.items():
         if value is None:
             continue
+        if param == "codex_args" and len(value) == 0:
+            continue
 
         param_key = param.replace("_", "_")
 
@@ -226,6 +237,22 @@ def set(config_path: Path, name: str, **kwargs):
             )
             continue
 
+        if param in [
+            "codex_executable",
+            "work_root",
+            "sandbox_mode",
+            "approval_mode",
+            "verbosity",
+            "reasoning_effort",
+            "capture_stdout",
+            "keep_task_dirs",
+            "codex_args",
+        ] and not llm_type.startswith("codex-process"):
+            logger.warning(
+                f"Parameter '{param}' is only applicable to Codex-process LLMs, but '{name}' is type '{llm_type}'"
+            )
+            continue
+
         # Validate temperature range
         if param == "temperature" and not (0.0 <= value <= 2.0):
             logger.critical(
@@ -234,6 +261,8 @@ def set(config_path: Path, name: str, **kwargs):
             sys.exit(1)
 
         config_key = param.replace("-", "_")
+        if config_key == "codex_args":
+            value = list(value)
 
         # Update the configuration
         old_value = llm_instance.get(config_key, "Not set")
@@ -290,6 +319,8 @@ def add(config_path: Path, name: str, quiet: bool):
         ("openai-reasoning", "OpenAI Reasoning API (o1 models)"),
         ("ollama", "Local Ollama server"),
         ("ollama-reasoning", "Local Ollama server with reasoning support"),
+        ("codex-process", "Codex agent/CLI process execution"),
+        ("codex-process-reasoning", "Codex agent/CLI process execution with reasoning output"),
     ]
 
     for i, (type_key, description) in enumerate(llm_types, 1):
@@ -331,7 +362,7 @@ def add(config_path: Path, name: str, quiet: bool):
         model = click.prompt(
             "Enter model name (press Enter for default)", default=models[0]
         )
-    else:  # ollama
+    elif llm_type.startswith("ollama"):  # ollama
         click.echo("Common Ollama models:")
         common_ollama_models = [
             "deepseek-r1:70b",
@@ -344,6 +375,12 @@ def add(config_path: Path, name: str, quiet: bool):
 
         model = click.prompt(
             "Enter model name (press Enter for default)", default="deepseek-r1:70b"
+        )
+    else:
+        click.echo("Recommended Codex process model:")
+        click.echo("  - gpt-5.3-codex")
+        model = click.prompt(
+            "Enter model name (press Enter for default)", default="gpt-5.3-codex"
         )
 
     llm_instance["model"] = model
@@ -383,7 +420,7 @@ def add(config_path: Path, name: str, quiet: bool):
                 click.echo("Temperature out of range, using default 0.5")
                 llm_instance["temperature"] = 0.5
 
-    else:  # ollama
+    elif llm_type.startswith("ollama"):  # ollama
         click.echo(f"\n3. {click.style('Ollama Configuration:', fg='yellow')}")
 
         # Host
@@ -399,6 +436,42 @@ def add(config_path: Path, name: str, quiet: bool):
         llm_instance["port"] = port
 
         click.echo(f"Will connect to: http://{host}:{port}")
+    else:
+        click.echo(f"\n3. {click.style('Codex Process Configuration:', fg='yellow')}")
+        llm_instance["codex_executable"] = click.prompt(
+            "Codex executable", default="codex"
+        )
+        llm_instance["work_root"] = click.prompt(
+            "Codex task work root", default="logs/codex_tasks"
+        )
+        llm_instance["sandbox_mode"] = click.prompt(
+            "Sandbox mode", type=click.Choice(["read-only", "workspace-write"]), default="workspace-write"
+        )
+        llm_instance["approval_mode"] = click.prompt(
+            "Approval mode", type=click.Choice(["never", "on-failure"]), default="never"
+        )
+        llm_instance["verbosity"] = click.prompt(
+            "Verbosity", type=click.Choice(["low", "medium", "high"]), default="medium"
+        )
+        llm_instance["reasoning_effort"] = click.prompt(
+            "Reasoning effort",
+            type=click.Choice(["low", "medium", "high", "xhigh"]),
+            default="medium",
+        )
+        llm_instance["capture_stdout"] = True
+        llm_instance["keep_task_dirs"] = True
+        llm_instance["codex_args"] = [
+            "exec",
+            "--model",
+            "{MODEL}",
+            "--sandbox",
+            "{SANDBOX_MODE}",
+            "--output-schema",
+            "{SCHEMA_JSON}",
+            "-o",
+            "{RESULT_TXT}",
+            "-",
+        ]
 
     click.echo(f"\n4. {click.style('Common Settings:', fg='yellow')}")
 
@@ -419,13 +492,19 @@ def add(config_path: Path, name: str, quiet: bool):
             default=default_max_tokens,
             type=int,
         )
-    else:  # OpenAI
+    elif llm_type.startswith("openai"):  # OpenAI
         default_max_tokens = -1
         click.echo("For OpenAI models, -1 uses the provider's default limit.")
         max_tokens = click.prompt(
             f"Max tokens (press Enter for default)",
             default=default_max_tokens,
             type=int,
+        )
+    else:
+        default_max_tokens = -1
+        click.echo("For Codex process execution, this field is retained for compatibility.")
+        max_tokens = click.prompt(
+            "Max tokens (press Enter for default)", default=default_max_tokens, type=int
         )
 
     llm_instance["max_tokens"] = max_tokens
@@ -437,8 +516,10 @@ def add(config_path: Path, name: str, quiet: bool):
             click.echo("Reasoning models may take longer to respond.")
         else:
             default_timeout = 30
-    else:  # OpenAI
+    elif llm_type.startswith("openai"):  # OpenAI
         default_timeout = 80
+    else:
+        default_timeout = 600
 
     timeout = click.prompt(
         f"Timeout seconds (press Enter for default)", default=default_timeout, type=int
@@ -752,6 +833,8 @@ def validate(config_path):
                 "openai-reasoning",
                 "ollama",
                 "ollama-reasoning",
+                "codex-process",
+                "codex-process-reasoning",
             ]:
                 issues.append(f"LLM '{name}': invalid llm_type '{llm_type}'")
 
@@ -770,6 +853,11 @@ def validate(config_path):
             elif llm_type in ["ollama", "ollama-reasoning"]:
                 if not config.get("host"):
                     warnings.append(f"LLM '{name}': no host specified (using default)")
+            elif llm_type in ["codex-process", "codex-process-reasoning"]:
+                if not config.get("codex_executable"):
+                    issues.append(f"LLM '{name}': missing codex_executable")
+                if not config.get("work_root"):
+                    issues.append(f"LLM '{name}': missing work_root")
 
     # Check module assignments
     modules = VALIDATION_MODULES

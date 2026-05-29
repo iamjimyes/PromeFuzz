@@ -12,6 +12,9 @@
   "host_frida_script": "/home/psy/droidot/target_APK/com.example.app/harnesses/Java_com_example_Class_nativeFoo@@0/afl.js",
   "host_seed_dir": "",
   "host_runtime_libcpp_path": "",
+  "host_runtime_overrides_env_path": "",
+  "host_repair_root": "/home/psy/droidot/promefuzz_repair_staging",
+  "host_extra_stage_files": [],
   "device_runtime_root": "/data/local/tmp/promefuzz-bigemu/sessions/replace_me_jni_baseline",
   "device_app_root": "/data/local/tmp/promefuzz-bigemu/apps/com.example.app",
   "target_library_basename": "libtarget.so",
@@ -37,5 +40,8 @@
   "droidot_skip_target_call": false,
   "droidot_mask_target_crash": false,
   "droidot_class_apk": "",
+  "repair_target_files": [
+    "harness.cpp"
+  ],
   "local_results_root": "android_runs/promefuzz-bigemu"
 }

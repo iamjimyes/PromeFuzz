@@ -128,6 +128,39 @@ For detailed usage of each subcommand, run:
 
 Additionally, a set of [utility scripts](database/utils/README.md) are available in the `database/utils/` directory to assist with common tasks such as fuzzing execution, coverage collection, and result evaluation.
 
+### Codex Process Execution
+
+This fork can also run text-generation tasks through a local or remote Codex agent/CLI process instead of a direct chat-completion API.
+
+Use `llm_type = "codex-process"` or `llm_type = "codex-process-reasoning"` and configure:
+
+- `model = "gpt-5.3-codex"`
+- `codex_executable`
+- `codex_args`
+- `work_root`
+
+The Codex path converts the original prompt into a task directory with:
+
+- `task.md`
+- `messages.json`
+- `inputs/*`
+- `outputs/expected_contract.json`
+- `outputs/output_schema.json`
+- `outputs/result.txt`
+
+The default real-CLI wiring uses:
+
+- `codex exec --model {MODEL} --sandbox {SANDBOX_MODE} --output-schema {SCHEMA_JSON} -o {RESULT_TXT} -`
+- the rendered execution task is sent on stdin because current Codex CLI does not accept the older `--task-file` / `--result-json` pair
+
+For converted prompts, PromeFuzz now expects structured output contracts instead of free-form prose:
+
+- code generation / repair: `{"kind":"code_file","code":"..."}`
+- excerpt / relevance selection: `{"kind":"json_array_indexes","indexes":[...]}`
+- summaries: `{"kind":"plain_summary","text":"..."}`
+- crash analysis: `{"kind":"analysis_verdict","verdict":"...","explanation":"..."}`
+- constraint learning: `{"kind":"constraints_and_code","constraints":{...},"code":"..."}`
+
 ### Droidot JNI Baseline
 
 This repository-local fork also includes a comparative baseline path for existing `droidot` JNI fuzz drivers.
@@ -139,13 +172,26 @@ The `droidot` workflow is intentionally separate from the main PromeFuzz C/C++ h
 - it stages the harness to a configured Android lane
 - it runs a bounded AFL session
 - it pulls back crashes and emits lightweight triage summaries
+- it can replay one explicit crashing input
+- it can classify one replay and attempt a harness-side repair in a remote temp workspace
 
 Use the template profile at `profiles/droidot_jni.template.json` and run:
 
 ```bash
 ./PromeFuzz.py droidot prepare --profile profiles/droidot_jni.template.json
 ./PromeFuzz.py droidot run --profile profiles/droidot_jni.template.json --session smoke_001
+./PromeFuzz.py droidot replay --profile profiles/droidot_jni.template.json --session smoke_001 --crash-index 0
+./PromeFuzz.py droidot repair --profile profiles/droidot_jni.template.json --session smoke_001 --crash-index 0
 ```
+
+Profile notes:
+
+- `host_runtime_overrides_env_path`: optional harness-owned `.env` file merged into runtime env
+- `host_extra_stage_files`: optional extra host files staged into the device session root
+- `host_repair_root`: remote temp root for patched harness verification
+- `repair_target_files`: files the repair loop is allowed to rewrite
+
+`droidot repair` reuses the configured analyzer LLM from `config.toml`, so it needs a valid PromeFuzz LLM configuration even though `prepare/run/pull/triage` can operate without library metadata.
 
 Below, we walk through a complete example using `pugixml` to demonstrate the end-to-end workflow.
 

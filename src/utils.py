@@ -14,7 +14,10 @@ import json
 
 from src import vars as global_vars
 from src.llm import llm as LLM
-from src.llm import rag as RAG
+try:
+    from src.llm import rag as RAG
+except Exception:
+    RAG = None
 
 
 def deep_merge(dist_dict: dict, src_dict: dict) -> dict:
@@ -161,6 +164,14 @@ def setup_llm(llm_name: str) -> LLM.LLMClient:
                 raise ValueError(
                     "OpenAI API key is neither provided nor found in the environment"
                 )
+    elif (
+        llm_type == LLM.LLM_TYPES.CODEX_PROCESS.value
+        or llm_type == LLM.LLM_TYPES.CODEX_PROCESS_REASONING.value
+    ):
+        selected_llm = deep_merge(
+            global_vars.config_template["llm"]["cloud_llm"],
+            selected_llm,
+        )
     else:
         raise ValueError(f"Unsupported LLM type: {llm_type}")
 
@@ -204,6 +215,36 @@ def setup_llm(llm_name: str) -> LLM.LLMClient:
                 selected_llm["timeout"],
                 selected_llm["retry_times"],
             )
+        case LLM.LLM_TYPES.CODEX_PROCESS.value:
+            llm_client = LLM.CodexProcessClient(
+                selected_llm["codex_executable"],
+                selected_llm.get("codex_args", []),
+                selected_llm["model"],
+                selected_llm["work_root"],
+                selected_llm["timeout"],
+                selected_llm["retry_times"],
+                selected_llm.get("sandbox_mode", "workspace-write"),
+                selected_llm.get("approval_mode", "never"),
+                selected_llm.get("verbosity", "medium"),
+                selected_llm.get("reasoning_effort", "medium"),
+                selected_llm.get("capture_stdout", True),
+                selected_llm.get("keep_task_dirs", True),
+            )
+        case LLM.LLM_TYPES.CODEX_PROCESS_REASONING.value:
+            llm_client = LLM.CodexProcessReasoningClient(
+                selected_llm["codex_executable"],
+                selected_llm.get("codex_args", []),
+                selected_llm["model"],
+                selected_llm["work_root"],
+                selected_llm["timeout"],
+                selected_llm["retry_times"],
+                selected_llm.get("sandbox_mode", "workspace-write"),
+                selected_llm.get("approval_mode", "never"),
+                selected_llm.get("verbosity", "medium"),
+                selected_llm.get("reasoning_effort", "medium"),
+                selected_llm.get("capture_stdout", True),
+                selected_llm.get("keep_task_dirs", True),
+            )
 
     # validate the LLM client
     if global_vars.config["llm"]["validate_llm"]:
@@ -219,7 +260,7 @@ def setup_llm(llm_name: str) -> LLM.LLMClient:
 def setup_rag(
     llm_name: str,
     database_path: Path = None,
-) -> RAG.RAGRetriever:
+):
     """
     Load the LLM configuration and setup the RAG retriever
 
@@ -229,6 +270,11 @@ def setup_rag(
     """
 
     # maybe download the nltk data
+    if RAG is None:
+        from src.llm import rag as RAG_module
+    else:
+        RAG_module = RAG
+
     try:
         setup_nltk_requiements()
     except Exception as e:
@@ -275,7 +321,7 @@ def setup_rag(
 
     # create the RAG retriever
     if llm_type == LLM.LLM_TYPES.OLLAMA.value:
-        rag_retriever = RAG.OllamaRetriever(
+        rag_retriever = RAG_module.OllamaRetriever(
             selected_llm["host"],
             selected_llm["port"],
             selected_llm["model"],
@@ -283,7 +329,7 @@ def setup_rag(
             database_path=database_path,
         )
     elif llm_type == LLM.LLM_TYPES.OPENAI.value:
-        rag_retriever = RAG.OpenAIRetriever(
+        rag_retriever = RAG_module.OpenAIRetriever(
             selected_llm["base_url"],
             selected_llm["api_key"],
             selected_llm["model"],
@@ -419,7 +465,7 @@ deduplicate_list: Callable[[list], list] = lambda l: list(dict.fromkeys(l))
 
 
 # concatenate excerpts list into human readable string
-concat_excerpts: Callable[[list[RAG.RAGExcerpt]], str] = lambda excerpts: "\n\n".join(
+concat_excerpts = lambda excerpts: "\n\n".join(
     f"{i + 1}. Excerpt from {excerpt.location}:\n```\n{excerpt.content}\n```"
     for i, excerpt in enumerate(excerpts)
 )

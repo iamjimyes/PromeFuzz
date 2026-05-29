@@ -11,7 +11,15 @@ from functools import cache
 from src.utils import concat_excerpts
 from src import vars as global_vars
 from . import llm
-from .rag import RAGExcerpt
+try:
+    from .rag import RAGExcerpt
+except Exception:
+    from dataclasses import dataclass
+
+    @dataclass
+    class RAGExcerpt:
+        content: str
+        location: str
 
 
 class Prompter(ABC):
@@ -47,6 +55,37 @@ class Prompter(ABC):
         """
         self.chat.system_prompt = system_prompt
 
+    @property
+    def use_exec_tasks(self) -> bool:
+        return self.chat.client.SUPPORTS_EXEC_TASKS
+
+    def build_exec_task(
+        self,
+        task_kind: str,
+        role: str,
+        objective: str,
+        rules: list[str],
+        output_contract: dict,
+        input_files: list[tuple[str, str]],
+        history_summary: str = "",
+    ) -> llm.ExecTaskSpec:
+        return llm.ExecTaskSpec(
+            task_kind=task_kind,
+            role=role,
+            objective=objective,
+            rules=rules,
+            output_contract=output_contract,
+            input_files=[
+                llm.ExecTaskFile(path=path, content=content)
+                for path, content in input_files
+            ],
+            history_summary=history_summary,
+        )
+
+    @staticmethod
+    def _json_block(text: str) -> str:
+        return "```json\n" + text + "\n```"
+
     @staticmethod
     @cache
     def _read_prompt(prompt_file_name: str) -> str:
@@ -57,7 +96,7 @@ class Prompter(ABC):
         :return: Prompt content
         """
         PROMPT_PATH = global_vars.promefuzz_path / "src" / "prompt"
-        return (PROMPT_PATH / prompt_file_name).read_text()
+        return (PROMPT_PATH / prompt_file_name).read_text(encoding="utf-8")
 
     @staticmethod
     def parse_code_from_llm_output(response: str, warning: bool = True) -> str:
@@ -205,7 +244,6 @@ class CGenPrompter(Prompter):
             LIBRARY_NAME=gen_requirements.library_name,
             LIBRARY_PURPOSE=gen_requirements.library_purpose,
         )
-        self.set_system_prompt(system_prompt)
 
         # make function strings
         if gen_requirements.api_order is not None:
@@ -234,6 +272,35 @@ class CGenPrompter(Prompter):
             )
         )
 
+        if self.use_exec_tasks:
+            task = self.build_exec_task(
+                task_kind="generate_driver",
+                role="You are maintaining a C fuzz driver in an existing codebase.",
+                objective="Generate one complete C fuzz driver that covers the requested target APIs.",
+                rules=[
+                    "Read all provided input files before producing the result.",
+                    "Output one complete compilable source file only.",
+                    "Call the requested target APIs and preserve the intended call order when provided.",
+                    "Do not output explanations, alternatives, or patch diffs.",
+                    "Prefer minimal helper code and keep the driver self-contained.",
+                ],
+                output_contract={
+                    "kind": "code_file",
+                    "language": "c",
+                    "code": "Complete fuzz driver source file.",
+                },
+                input_files=[
+                    ("inputs/system_prompt.txt", system_prompt),
+                    ("inputs/request.txt", user_prompt),
+                    ("inputs/target_functions.txt", function_str),
+                    ("inputs/data_definitions.c", self.format_code(gen_requirements.data_definitions)),
+                    ("inputs/headers.txt", gen_requirements.headers),
+                ],
+            )
+            raw_result = self.chat.query_exec_task(task) or {}
+            return raw_result.get("code", "")
+
+        self.set_system_prompt(system_prompt)
         fuzz_driver_code = self.chat.query(user_prompt)
         return self.parse_code_from_llm_output(fuzz_driver_code)
 
@@ -269,7 +336,6 @@ class CppGenPrompter(Prompter):
             LIBRARY_NAME=gen_requirements.library_name,
             LIBRARY_PURPOSE=gen_requirements.library_purpose,
         )
-        self.set_system_prompt(system_prompt)
 
         # make function strings
         if gen_requirements.api_order is not None:
@@ -309,6 +375,39 @@ class CppGenPrompter(Prompter):
             )
         )
 
+        if self.use_exec_tasks:
+            task = self.build_exec_task(
+                task_kind="generate_driver",
+                role="You are maintaining a C++ fuzz driver in an existing codebase.",
+                objective="Generate one complete C++ fuzz driver that covers the requested target APIs.",
+                rules=[
+                    "Read all provided input files before producing the result.",
+                    "Output one complete compilable source file only.",
+                    "Call the requested target APIs and preserve the intended call order when provided.",
+                    "Do not output explanations, alternatives, or patch diffs.",
+                    "Prefer minimal helper code and keep the driver self-contained.",
+                ],
+                output_contract={
+                    "kind": "code_file",
+                    "language": "cpp",
+                    "code": "Complete fuzz driver source file.",
+                },
+                input_files=[
+                    ("inputs/system_prompt.txt", system_prompt),
+                    ("inputs/request.txt", user_prompt),
+                    ("inputs/target_functions.txt", function_str),
+                    ("inputs/data_definitions.cpp", self.format_code(gen_requirements.data_definitions)),
+                    (
+                        "inputs/constructors.txt",
+                        self.format_code(gen_requirements.constructor_signatures),
+                    ),
+                    ("inputs/headers.txt", gen_requirements.headers),
+                ],
+            )
+            raw_result = self.chat.query_exec_task(task) or {}
+            return raw_result.get("code", "")
+
+        self.set_system_prompt(system_prompt)
         fuzz_driver_code = self.chat.query(user_prompt)
         return self.parse_code_from_llm_output(fuzz_driver_code)
 
@@ -329,6 +428,35 @@ class FixPrompter(Prompter):
         :return: Fixed code
         """
         user_prompt = self.fix_prompt.format(ERROR_MESSAGE=error_message)
+        if self.use_exec_tasks:
+            current_code = self.chat.history[-1]["content"] if self.chat.history else ""
+            current_code = Prompter.parse_code_from_llm_output(
+                current_code, warning=False
+            )
+            task = self.build_exec_task(
+                task_kind="fix_driver",
+                role="You are repairing an existing fuzz driver source file.",
+                objective="Repair the provided source file to resolve the provided error.",
+                rules=[
+                    "Edit the code minimally.",
+                    "Keep the existing harness structure and target API coverage whenever possible.",
+                    "Output the full corrected source file only.",
+                    "Do not output explanations or patch diffs.",
+                ],
+                output_contract={
+                    "kind": "code_file",
+                    "language": self.language_tag,
+                    "code": "Complete corrected source file.",
+                },
+                input_files=[
+                    ("inputs/current_code." + self.language_tag, current_code),
+                    ("inputs/error.txt", error_message),
+                    ("inputs/request.txt", user_prompt),
+                ],
+                history_summary="The current code is the latest assistant reply in chat history.",
+            )
+            raw_result = self.chat.query_exec_task(task) or {}
+            return raw_result.get("code", "")
         fixed_code = self.chat.query(user_prompt)
         return Prompter.parse_code_from_llm_output(fixed_code)
 
@@ -384,7 +512,6 @@ class LibPurposePrompter(Prompter):
         system_prompt = self.system_prompt.format(
             LIBRARY_NAME=library_name,
         )
-        self.set_system_prompt(system_prompt)
 
         # set user prompt
         user_prompt = self.user_prompt.format(
@@ -392,6 +519,30 @@ class LibPurposePrompter(Prompter):
             DOC_EXCERPTS=excerpts_str,
         )
 
+        if self.use_exec_tasks:
+            task = self.build_exec_task(
+                task_kind="library_purpose",
+                role="You are writing a repository-style description of one software library.",
+                objective="Summarize the purpose of the library from the provided excerpts.",
+                rules=[
+                    "Write one short plain-text summary.",
+                    "Do not output bullets, headings, or explanations.",
+                    "Stay conservative when the excerpts are incomplete.",
+                ],
+                output_contract={
+                    "kind": "plain_summary",
+                    "text": "A short plain-text summary of the library purpose.",
+                },
+                input_files=[
+                    ("inputs/system_prompt.txt", system_prompt),
+                    ("inputs/request.txt", user_prompt),
+                    ("inputs/document_excerpts.txt", excerpts_str),
+                ],
+            )
+            raw_result = self.chat.query_exec_task(task) or {}
+            return raw_result.get("text", "")
+
+        self.set_system_prompt(system_prompt)
         # query LLM
         summary = self.chat.query(user_prompt)
 
@@ -431,13 +582,40 @@ class ValuableExcerptsPrompter(Prompter):
             LIBRARY_NAME=library_name,
             FUNCTION_NAME=function_name,
         )
-        self.set_system_prompt(system_prompt)
 
         # set user prompt
         user_prompt = self.user_prompt.format(
             DOC_EXCERPTS=excerpt_str,
         )
 
+        if self.use_exec_tasks:
+            task = self.build_exec_task(
+                task_kind="valuable_excerpts",
+                role="You are selecting documentation excerpts relevant to one API usage question.",
+                objective="Choose which document excerpts are directly useful for understanding the target function usage.",
+                rules=[
+                    "Return only indexes of relevant excerpts.",
+                    "Indexes must be zero-based.",
+                    "Do not output explanations or any extra text.",
+                ],
+                output_contract={
+                    "kind": "json_array_indexes",
+                    "indexes": [0],
+                },
+                input_files=[
+                    ("inputs/system_prompt.txt", system_prompt),
+                    ("inputs/request.txt", user_prompt),
+                    ("inputs/document_excerpts.txt", excerpt_str),
+                ],
+            )
+            raw_result = self.chat.query_exec_task(task) or {}
+            return [
+                index
+                for index in raw_result.get("indexes", [])
+                if isinstance(index, int) and 0 <= index < len(document_excerpts)
+            ]
+
+        self.set_system_prompt(system_prompt)
         # query LLM
         response = self.chat.query(user_prompt)
 
@@ -481,7 +659,6 @@ class FuncUsageFromDocPrompter(Prompter):
         system_prompt = self.system_prompt.format(
             LIBRARY_NAME=library_name,
         )
-        self.set_system_prompt(system_prompt)
 
         # set user prompt
         user_prompt = self.user_prompt.format(
@@ -492,6 +669,33 @@ class FuncUsageFromDocPrompter(Prompter):
             DOC_EXCERPTS=concat_excerpts(document_excerpts),
         )
 
+        if self.use_exec_tasks:
+            task = self.build_exec_task(
+                task_kind="function_usage_from_doc",
+                role="You are writing a repository-style usage note for one API function.",
+                objective="Summarize the function usage from signatures, source, and selected document excerpts.",
+                rules=[
+                    "Write one plain-text usage note only.",
+                    "Include purpose, key preconditions, and obvious ownership or misuse constraints when visible.",
+                    "Do not restate the signatures verbatim.",
+                    "Do not output headings or bullet lists.",
+                ],
+                output_contract={
+                    "kind": "plain_summary",
+                    "text": "One plain-text usage note.",
+                },
+                input_files=[
+                    ("inputs/system_prompt.txt", system_prompt),
+                    ("inputs/request.txt", user_prompt),
+                    ("inputs/function_signatures.txt", self.format_code(function_signatures)),
+                    ("inputs/function_source." + self.language_tag, self.format_code(function_source_code)),
+                    ("inputs/document_excerpts.txt", concat_excerpts(document_excerpts)),
+                ],
+            )
+            raw_result = self.chat.query_exec_task(task) or {}
+            return raw_result.get("text", "")
+
+        self.set_system_prompt(system_prompt)
         # query LLM
         response = self.chat.query(user_prompt)
 
@@ -530,7 +734,6 @@ class FuncUsageFromSrcPrompter(Prompter):
         system_prompt = self.system_prompt.format(
             LIBRARY_NAME=library_name,
         )
-        self.set_system_prompt(system_prompt)
 
         # set user prompt
         user_prompt = self.user_prompt.format(
@@ -540,6 +743,32 @@ class FuncUsageFromSrcPrompter(Prompter):
             FUNCTION_SOURCE_CODE=self.format_code(function_source_code),
         )
 
+        if self.use_exec_tasks:
+            task = self.build_exec_task(
+                task_kind="function_usage_from_src",
+                role="You are writing a repository-style usage note for one API function.",
+                objective="Summarize the function usage from signatures and source code only.",
+                rules=[
+                    "Write one plain-text usage note only.",
+                    "Include purpose, key preconditions, and obvious ownership or misuse constraints when visible.",
+                    "Do not restate the signatures verbatim.",
+                    "Do not output headings or bullet lists.",
+                ],
+                output_contract={
+                    "kind": "plain_summary",
+                    "text": "One plain-text usage note.",
+                },
+                input_files=[
+                    ("inputs/system_prompt.txt", system_prompt),
+                    ("inputs/request.txt", user_prompt),
+                    ("inputs/function_signatures.txt", self.format_code(function_signatures)),
+                    ("inputs/function_source." + self.language_tag, self.format_code(function_source_code)),
+                ],
+            )
+            raw_result = self.chat.query_exec_task(task) or {}
+            return raw_result.get("text", "")
+
+        self.set_system_prompt(system_prompt)
         # query LLM
         response = self.chat.query(user_prompt)
 
@@ -580,7 +809,6 @@ class FuncRelevancePrompter(Prompter):
             LIBRARY_NAME=library_name,
             LIBRARY_PURPOSE=library_purpose,
         )
-        self.set_system_prompt(system_prompt)
 
         # make candidate functions string
         candidate_str = "".join(
@@ -603,6 +831,34 @@ class FuncRelevancePrompter(Prompter):
             LANGUAGE_TAG=self.language_tag,
         )
 
+        if self.use_exec_tasks:
+            task = self.build_exec_task(
+                task_kind="function_relevance",
+                role="You are selecting API functions relevant to a target API.",
+                objective="Choose candidate functions relevant to the target function by semantics, state, or resource dependency.",
+                rules=[
+                    "Return only indexes of relevant candidate functions.",
+                    "Indexes must be zero-based.",
+                    "Do not output explanations or extra text.",
+                ],
+                output_contract={
+                    "kind": "json_array_indexes",
+                    "indexes": [0],
+                },
+                input_files=[
+                    ("inputs/system_prompt.txt", system_prompt),
+                    ("inputs/request.txt", user_prompt),
+                    ("inputs/candidate_functions.txt", candidate_str),
+                ],
+            )
+            raw_result = self.chat.query_exec_task(task) or {}
+            return [
+                index
+                for index in raw_result.get("indexes", [])
+                if isinstance(index, int) and 0 <= index < len(candidate_functions)
+            ]
+
+        self.set_system_prompt(system_prompt)
         # query LLM
         response = self.chat.query(user_prompt)
 
@@ -647,7 +903,6 @@ class CrashConstraintPrompter(Prompter):
             LIBRARY_NAME=library_name,
             LIBRARY_PURPOSE=library_purpose,
         )
-        self.set_system_prompt(system_prompt)
 
         # prepare explain prompt
         explain_prompt = self.explaint_prompt.format(
@@ -661,6 +916,36 @@ class CrashConstraintPrompter(Prompter):
         )
         fix_prompt = self.fix_prompt
 
+        if self.use_exec_tasks:
+            task = self.build_exec_task(
+                task_kind="crash_constraints",
+                role="You are learning stable API constraints from a fuzz-driver crash.",
+                objective="Infer repository-usable constraints for the related APIs and provide a corrected full source file.",
+                rules=[
+                    "Return one JSON object mapping API function names to constraint text.",
+                    "Return one complete corrected source file.",
+                    "Do not output explanations outside the result JSON.",
+                    "Only include constraints supported by the crash evidence.",
+                ],
+                output_contract={
+                    "kind": "constraints_and_code",
+                    "constraints": {"api_function": "Constraint text."},
+                    "code": "Complete corrected source file.",
+                },
+                input_files=[
+                    ("inputs/system_prompt.txt", system_prompt),
+                    ("inputs/crash_report.txt", crash_report),
+                    ("inputs/request_learn.txt", learn_prompt),
+                    ("inputs/request_fix.txt", fix_prompt),
+                ],
+            )
+            raw_result = self.chat.query_exec_task(task) or {}
+            constraints = raw_result.get("constraints", {})
+            return constraints if isinstance(constraints, dict) else {}, raw_result.get(
+                "code", ""
+            )
+
+        self.set_system_prompt(system_prompt)
         # query LLM
         # first query for explanation
         self.chat.query(explain_prompt)
@@ -736,6 +1021,36 @@ class CrashContraintReasoningPrompter(Prompter):
         )
         fix_prompt = self.fix_prompt
 
+        if self.use_exec_tasks:
+            task = self.build_exec_task(
+                task_kind="crash_constraints",
+                role="You are learning stable API constraints from a fuzz-driver crash.",
+                objective="Infer repository-usable constraints for the related APIs and provide a corrected full source file.",
+                rules=[
+                    "Return one JSON object mapping API function names to constraint text.",
+                    "Return one complete corrected source file.",
+                    "Do not output explanations outside the result JSON.",
+                    "Only include constraints supported by the crash evidence.",
+                ],
+                output_contract={
+                    "kind": "constraints_and_code",
+                    "constraints": {"api_function": "Constraint text."},
+                    "code": "Complete corrected source file.",
+                },
+                input_files=[
+                    ("inputs/system_prompt.txt", system_prompt),
+                    ("inputs/crash_report.txt", crash_report),
+                    ("inputs/request_learn.txt", learn_prompt),
+                    ("inputs/request_fix.txt", fix_prompt),
+                ],
+            )
+            raw_result, _ = self.chat.query_exec_task_reasoning(task)
+            raw_result = raw_result or {}
+            constraints = raw_result.get("constraints", {})
+            return constraints if isinstance(constraints, dict) else {}, raw_result.get(
+                "code", ""
+            )
+
         # query LLM
         # first query for learning
         constraint_response = self.chat.query(system_prompt + "\n" + learn_prompt)
@@ -787,6 +1102,40 @@ class CrashAnalysisPrompter(Prompter):
             LIBRARY_PURPOSE=library_purpose,
             LIBRARY_NAME=library_name,
         )
+        if self.use_exec_tasks:
+            task = self.build_exec_task(
+                task_kind="crash_analysis",
+                role="You are classifying one crash from a fuzzing campaign.",
+                objective="Classify the crash and explain the classification.",
+                rules=[
+                    "Use verdict values bug_in_library, misuse_in_fuzz_driver, or unknown.",
+                    "Write one plain-text explanation.",
+                    "Do not output extra sections or commentary.",
+                ],
+                output_contract={
+                    "kind": "analysis_verdict",
+                    "verdict": "bug_in_library",
+                    "explanation": "Plain-text explanation.",
+                },
+                input_files=[
+                    ("inputs/system_prompt.txt", system_prompt),
+                    ("inputs/crash_report.txt", crash_report),
+                ],
+            )
+            raw_result, reasoning = self.chat.query_exec_task_reasoning(task)
+            raw_result = raw_result or {}
+            verdict = raw_result.get("verdict", "unknown")
+            verdict_text = {
+                "bug_in_library": "Bug in library",
+                "misuse_in_fuzz_driver": "Misuse in fuzz driver",
+                "unknown": "Unknown",
+            }.get(verdict, verdict)
+            analysis = "Verdict: {}\nExplanation:\n{}".format(
+                verdict_text,
+                raw_result.get("explanation", ""),
+            ).strip()
+            return analysis, reasoning
+
         if isinstance(self.chat.client, llm.ReasoningLLMClient):
             # For reasoning model, it is recommended that no system prompt is set
             user_prompt = system_prompt + "\n"
@@ -801,3 +1150,106 @@ class CrashAnalysisPrompter(Prompter):
 
         # query LLM
         return self.chat.query_reasoning(user_prompt)
+
+
+class DroidotRepairPrompter(Prompter):
+    """
+    Prompter to classify one droidot replay and propose a concrete repair.
+    """
+
+    def _load_prompt(self):
+        self.system_prompt = ""
+        self.user_prompt = ""
+
+    def prompt(
+        self,
+        replay_log: str,
+        triage_summary: dict[str, str],
+        harness_code: str,
+        info_json: str,
+        runtime_overrides_text: str,
+        allowed_target_files: list[str],
+    ) -> dict[str, str]:
+        rules = [
+            "Allowed verdict values: harness_fp, runtime_setup_fp, target_crash, unknown.",
+            "Only propose edits when the evidence supports a false positive or setup issue.",
+            "Allowed target files are: " + ", ".join(allowed_target_files) + ".",
+            "Return a full replacement file content when target_file is not empty.",
+            "If no edit is justified, return target_file as an empty string and updated_file_content as an empty string.",
+        ]
+        output_contract = {
+            "kind": "droidot_repair",
+            "verdict": "harness_fp",
+            "target_file": "harness.cpp",
+            "root_cause": "Short explanation.",
+            "updated_file_content": "Full replacement file content.",
+            "verification_expectation": "What should change after the fix.",
+        }
+        input_files = [
+            ("inputs/replay.log", replay_log),
+            (
+                "inputs/triage.json",
+                json.dumps(triage_summary, indent=2, sort_keys=True),
+            ),
+            ("inputs/harness.cpp", harness_code),
+            ("inputs/info.json", info_json),
+            (
+                "inputs/runtime_overrides.env",
+                runtime_overrides_text or "# no runtime_overrides.env\n",
+            ),
+        ]
+
+        if self.use_exec_tasks:
+            task = self.build_exec_task(
+                task_kind="droidot_repair",
+                role="You are repairing one Android JNI fuzz driver after a deterministic replay.",
+                objective="Classify whether the replay is a harness/setup false positive or a likely target crash, and provide one file-level repair when justified.",
+                rules=rules,
+                output_contract=output_contract,
+                input_files=input_files,
+            )
+            raw_result = self.chat.query_exec_task(task) or {}
+            return {
+                "verdict": raw_result.get("verdict", "unknown"),
+                "target_file": raw_result.get("target_file", ""),
+                "root_cause": raw_result.get("root_cause", ""),
+                "updated_file_content": raw_result.get("updated_file_content", ""),
+                "verification_expectation": raw_result.get(
+                    "verification_expectation", ""
+                ),
+            }
+
+        prompt = "\n\n".join(
+            [
+                "You are repairing one Android JNI fuzz driver after a deterministic replay.",
+                "\n".join(f"- {rule}" for rule in rules),
+                "Replay log:\n```text\n" + replay_log + "\n```",
+                "Triage summary:\n```json\n"
+                + json.dumps(triage_summary, indent=2, sort_keys=True)
+                + "\n```",
+                "Current harness.cpp:\n```cpp\n" + harness_code + "\n```",
+                "Current info.json:\n```json\n" + info_json + "\n```",
+                "Current runtime_overrides.env:\n```text\n"
+                + (runtime_overrides_text or "# no runtime_overrides.env\n")
+                + "\n```",
+                "Respond with one JSON object matching this schema:\n```json\n"
+                + json.dumps(output_contract, indent=2)
+                + "\n```",
+            ]
+        )
+        response = self.chat.query(prompt)
+        try:
+            parsed = json.loads(self.parse_code_from_llm_output(response, warning=False))
+        except Exception:
+            try:
+                parsed = json.loads(response)
+            except Exception:
+                logger.warning("Failed to parse droidot repair response as JSON")
+                parsed = {}
+        return {
+            "verdict": parsed.get("verdict", "unknown"),
+            "target_file": parsed.get("target_file", ""),
+            "root_cause": parsed.get("root_cause", ""),
+            "updated_file_content": parsed.get("updated_file_content", ""),
+            "verification_expectation": parsed.get("verification_expectation", ""),
+        }

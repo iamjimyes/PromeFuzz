@@ -8,6 +8,7 @@ import sys
 import tomllib
 import click
 import importlib
+import hashlib
 from pathlib import Path
 from loguru import logger
 import datetime
@@ -68,11 +69,11 @@ def setup_logger(debug: bool):
     )
     Path("logs").mkdir(exist_ok=True)
     argv_str = "_".join(sys.argv).replace(" ", "_").replace("/", "_").replace("\\", "_")
+    argv_hash = hashlib.sha1(" ".join(sys.argv).encode("utf-8")).hexdigest()[:10]
+    short_argv = argv_str[:80].rstrip("_")
     log_filename = (
-        f"logs/{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{argv_str}.log"
+        f"logs/{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{short_argv}_{argv_hash}.log"
     )
-    if len(log_filename) > 255:
-        log_filename = log_filename[:200] + ".log"
     logger.add(
         log_filename,
         level=level,
@@ -97,10 +98,40 @@ def load_config(config_path: Path, library_path: Path):
         logger.debug("Help flag detected; skipping configuration loading.")
         return
 
-    if click.get_current_context().invoked_subcommand in {"configure", "droidot"}:
+    invoked = click.get_current_context().invoked_subcommand
+    if invoked == "configure":
         global_vars.config = {}
         global_vars.config_template = {}
         global_vars.libraries = {}
+        return
+
+    if invoked == "droidot":
+        global_vars.config = {}
+        global_vars.libraries = {}
+        global_vars.config_template = tomllib.loads(
+            (Path(__file__).resolve().parent / "config.template.toml").read_text()
+        )
+        global_vars.libraries_template = tomllib.loads(
+            (Path(__file__).resolve().parent / "libraries.template.toml").read_text()
+        )
+        global_vars.promefuzz_path = Path(__file__).resolve().parent
+        if config_path.exists():
+            global_vars.config = tomllib.loads(config_path.read_text())
+        if library_path.exists():
+            global_vars.libraries = tomllib.loads(library_path.read_text())
+        if "bin" in global_vars.config or global_vars.config_template:
+            def _set_bin_path(bin_name):
+                bin_path = global_vars.config.get(
+                    "bin", global_vars.config_template["bin"]
+                ).get(bin_name, global_vars.config_template["bin"][bin_name])
+                if r"{PROMEFUZZ_PATH}" in bin_path:
+                    bin_path = bin_path.format(
+                        PROMEFUZZ_PATH=global_vars.promefuzz_path
+                    )
+                global_vars.config.setdefault("bin", dict())[bin_name] = bin_path
+
+            _set_bin_path("preprocessor")
+            _set_bin_path("cgprocessor")
         return
 
     try:
