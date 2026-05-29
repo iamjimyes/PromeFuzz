@@ -30,6 +30,11 @@
   "seed_subdir": "seeds",
   "synthetic_seed_name": "seed-empty",
   "remote_compile_dir": "/data/local/tmp/promefuzz-bigemu/build",
+  "compile_mode": "auto",
+  "device_compile_cxx": "/data/data/com.termux/files/usr/bin/g++",
+  "host_compile_cxx": "C:\\Microsoft\\AndroidNDK\\android-ndk-r23c\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android31-clang++.cmd",
+  "host_compile_strip": "C:\\Microsoft\\AndroidNDK\\android-ndk-r23c\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\llvm-strip.exe",
+  "local_build_root": "build/promefuzz-bigemu",
   "androlib_memory_name": "memory",
   "afl_preload_paths": [
     "/data/data/com.termux/files/usr/lib/libc++_shared.so",

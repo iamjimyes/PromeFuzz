@@ -65,6 +65,10 @@ Store pulled results under:
 
 - `PromeFuzz/android_runs/promefuzz-bigemu/<profile>/<session>`
 
+Store local host-compile staging under:
+
+- `PromeFuzz/build/promefuzz-bigemu/host_compile/<profile>/<debug|release>/<tag>`
+
 This keeps PromeFuzz baseline results separate from:
 
 - `granzon` maintained outputs
@@ -95,10 +99,38 @@ These fields define the minimum reusable contract:
   - session namespace under `/data/local/tmp/promefuzz-bigemu/sessions/...`
 - `device_app_root`
   - app staging namespace under `/data/local/tmp/promefuzz-bigemu/apps/...`
+- `compile_mode`
+  - `auto`, `device`, or `host`
+  - `auto` tries device compile first and falls back to host Android compile
+- `device_compile_cxx`
+  - device-side compiler path when `compile_mode` uses the device route
+- `host_compile_cxx`
+  - Windows-host Android NDK compiler path such as
+    `aarch64-linux-android31-clang++.cmd`
+- `host_compile_strip`
+  - optional Windows-host strip tool such as `llvm-strip.exe`
+- `local_build_root`
+  - local compile staging root; for bigemu keep this under
+    `build/promefuzz-bigemu`
 - `afl_preload_paths`
   - loader hints for AFL child startup
   - keep `/data/data/com.termux/files/usr/lib/libc++_shared.so` first when
     the harness expects Termux-style runtime layout
+
+## Compile Route Rule
+
+Use this order for bigemu maintained-lane profiles:
+
+1. `compile_mode=auto`
+2. try `device_compile_cxx`
+3. if the device compiler is absent, compile locally with `host_compile_cxx`
+4. upload the rebuilt `harness` back into `host_harness_dir`
+
+Rationale:
+
+- bigemu currently does not guarantee a Termux-style device compiler
+- PromeFuzz therefore treats Windows-host Android NDK compile as the baseline
+  recovery path instead of assuming device-side `g++`
 
 ## Runtime Selection Rule
 

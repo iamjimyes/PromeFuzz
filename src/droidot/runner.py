@@ -64,6 +64,10 @@ def _sanitize_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "item"
 
 
+class CompileRouteUnavailableError(RuntimeError):
+    pass
+
+
 @dataclass(slots=True)
 class StagedDeviceFile:
     host_path: str
@@ -106,6 +110,11 @@ class DroidotProfile:
     seed_subdir: str = "seeds"
     synthetic_seed_name: str = "seed-empty"
     remote_compile_dir: str = "/data/local/tmp/fuzzing_compile"
+    compile_mode: str = "auto"
+    device_compile_cxx: str = "/data/data/com.termux/files/usr/bin/g++"
+    host_compile_cxx: str = ""
+    host_compile_strip: str = ""
+    local_build_root: str = "build/promefuzz-bigemu"
     androlib_memory_name: str = "memory"
     afl_preload_paths: list[str] = field(default_factory=list)
     extra_env: dict[str, str] = field(default_factory=dict)
@@ -117,6 +126,7 @@ class DroidotProfile:
     host_seed_dir: str = ""
     host_runtime_libcpp_path: str = ""
     host_runtime_overrides_env_path: str = ""
+    runtime_overrides_env_text: str = ""
     host_repair_root: str = ""
     host_extra_stage_files: list[StagedDeviceFile] = field(default_factory=list)
     repair_target_files: list[str] = field(default_factory=lambda: ["harness.cpp"])
@@ -173,6 +183,10 @@ class DroidotProfile:
     @property
     def local_results_path(self) -> Path:
         return Path(self.local_results_root) / self.name
+
+    @property
+    def local_build_path(self) -> Path:
+        return Path(self.local_build_root)
 
     def container_path_for_host(self, host_path: str | Path) -> str:
         host_path = Path(host_path)
@@ -423,9 +437,12 @@ class DroidotBaselineRunner:
 
         verify_profile = self._clone_profile_for_remote_harness(
             remote_harness_dir,
-            runtime_overrides_path=(
-                f"{remote_harness_dir}/runtime_overrides.env"
-                if target_file == "runtime_overrides.env" or runtime_overrides_meta["candidate_path"]
+            runtime_overrides_text=(
+                target_local_path.read_text(encoding="utf-8", errors="replace")
+                if (
+                    target_file == "runtime_overrides.env"
+                    or runtime_overrides_meta["candidate_path"]
+                )
                 else ""
             ),
         )
@@ -876,32 +893,57 @@ class DroidotBaselineRunner:
         debug_build: bool,
         compile_tag: str,
     ) -> dict[str, Any]:
-        harness_parent = str(PurePosixPath(host_harness_dir).parent)
-        harness_folder = PurePosixPath(host_harness_dir).name
         remote_compile_dir = (
             f"{self.profile.remote_compile_dir.rstrip('/')}/{_sanitize_name(compile_tag)}"
         )
-        debug_value = "True" if debug_build else "False"
-        inline = f"""
-from harness.compile_harness import init_compilation, compile_harness
-remote_folder = {remote_compile_dir!r}
-device_id = {self.profile.device_serial!r}
-harness_parent = {harness_parent!r}
-harness_folder = {harness_folder!r}
-init_compilation(remote_folder, debug={debug_value}, path="harness", device_id=device_id)
-compile_harness(
-    harness_folder,
-    harness_parent,
-    remote_folder,
-    debug={debug_value},
-    device_id=device_id,
-)
-"""
-        command = (
-            f"cd {shlex.quote(self.profile.host_work_root)} && "
-            f"python3 - <<'PY'\n{inline}\nPY"
+        compile_mode = (self.profile.compile_mode or "auto").strip().lower()
+        if compile_mode not in {"auto", "device", "host"}:
+            raise ValueError(
+                f"Unsupported compile_mode {self.profile.compile_mode!r}; expected auto, device, or host"
+            )
+
+        attempted_routes: list[str] = []
+        route_errors: list[dict[str, str]] = []
+        result: subprocess.CompletedProcess[str] | None = None
+        compile_route = ""
+
+        if compile_mode in {"auto", "device"}:
+            attempted_routes.append("device")
+            try:
+                result = self._compile_remote_harness_device(
+                    host_harness_dir,
+                    debug_build=debug_build,
+                    remote_compile_dir=remote_compile_dir,
+                )
+                compile_route = "device"
+            except CompileRouteUnavailableError as exc:
+                route_errors.append({"route": "device", "error": str(exc)})
+                if compile_mode == "device":
+                    raise
+                logger.warning(
+                    "device compile route unavailable; falling back to host route.\n"
+                    f"{exc}"
+                )
+
+        if result is None:
+            attempted_routes.append("host")
+            result = self._compile_remote_harness_host(
+                host_harness_dir,
+                debug_build=debug_build,
+                compile_tag=compile_tag,
+            )
+            compile_route = "host"
+
+        artifact_status = self._remote_harness_artifact_status(
+            host_harness_dir,
+            debug_build=debug_build,
         )
-        result = self._run_remote(command, check=True)
+        if not artifact_status["up_to_date"]:
+            raise RuntimeError(
+                "Harness binary was not refreshed after compile.\n"
+                f"artifact_status={json.dumps(artifact_status, sort_keys=True)}\n"
+                f"compile_stdout=\n{result.stdout}\ncompile_stderr=\n{result.stderr}"
+            )
         return {
             "status": "built",
             "prepared_at": _now_utc(),
@@ -909,7 +951,294 @@ compile_harness(
             "stderr": result.stderr,
             "remote_compile_dir": remote_compile_dir,
             "host_harness_dir": host_harness_dir,
+            "artifact_status": artifact_status,
+            "compile_route": compile_route,
+            "attempted_routes": attempted_routes,
+            "route_errors": route_errors,
         }
+
+    def _remote_harness_artifact_status(
+        self,
+        host_harness_dir: str,
+        *,
+        debug_build: bool,
+    ) -> dict[str, Any]:
+        harness_name = "harness_debug" if debug_build else self.profile.harness_binary_name
+        source_name = f"{harness_name}.cpp"
+        source_path = f"{host_harness_dir}/{source_name}"
+        output_path = f"{host_harness_dir}/{harness_name}"
+        inline = f"""
+import json
+import os
+
+source_path = {source_path!r}
+output_path = {output_path!r}
+source_exists = os.path.isfile(source_path)
+output_exists = os.path.isfile(output_path)
+source_mtime = os.path.getmtime(source_path) if source_exists else None
+output_mtime = os.path.getmtime(output_path) if output_exists else None
+print(json.dumps({{
+    "source_path": source_path,
+    "output_path": output_path,
+    "source_exists": source_exists,
+    "output_exists": output_exists,
+    "source_mtime": source_mtime,
+    "output_mtime": output_mtime,
+    "up_to_date": bool(source_exists and output_exists and output_mtime is not None and source_mtime is not None and output_mtime >= source_mtime),
+}}, sort_keys=True))
+"""
+        command = f"python3 - <<'PY'\n{inline}\nPY"
+        result = self._run_remote(command, check=True)
+        return json.loads(result.stdout)
+
+    def _compile_remote_harness_device(
+        self,
+        host_harness_dir: str,
+        *,
+        debug_build: bool,
+        remote_compile_dir: str,
+    ) -> subprocess.CompletedProcess[str]:
+        harness_name = "harness_debug" if debug_build else self.profile.harness_binary_name
+        source_name = f"{harness_name}.cpp"
+        flags = "-g3 -O0" if debug_build else ""
+        host_support_dir = str(PurePosixPath(self.profile.host_libharness_path).parent)
+        container_harness_cpp = self.profile.container_path_for_host(
+            f"{host_harness_dir}/{source_name}"
+        )
+        container_output_path = self.profile.container_path_for_host(
+            f"{host_harness_dir}/{harness_name}"
+        )
+        container_support_dir = self.profile.container_path_for_host(host_support_dir)
+        compiler_cmd = self.profile.device_compile_cxx.strip() or "g++"
+        compile_command = " ".join(
+            part
+            for part in [
+                f"cd {remote_compile_dir}",
+                f"&& {shlex.quote(compiler_cmd)} -std=c++17 -L. -lharness",
+                flags,
+                "-Wall -std=c++17 -Wl,--export-dynamic -Wl,-rpath,\\$ORIGIN",
+                f"{source_name} -o {harness_name}",
+            ]
+            if part
+        )
+        compiler_probe_command = (
+            f"if [ -x {shlex.quote(compiler_cmd)} ]; then printf exists; "
+            f"elif command -v {shlex.quote(compiler_cmd)} >/dev/null 2>&1; then printf exists; "
+            "else printf missing; fi"
+        )
+        compiler_probe = self._run_remote(
+            self._render_container_adb_root(compiler_probe_command),
+            check=True,
+        )
+        if compiler_probe.stdout.strip() != "exists":
+            raise CompileRouteUnavailableError(
+                "No device-side C++ compiler is available for droidot compile. "
+                f"Tried `{compiler_cmd}` on {self.profile.device_serial}. "
+                "Install a device compiler for this lane or configure a different compile route."
+            )
+        script = "\n".join(
+            [
+                "set -e",
+                self._render_container_adb_root(
+                    f"rm -rf {remote_compile_dir} && mkdir -p {remote_compile_dir}"
+                ),
+                self._render_container_adb_push(
+                    container_harness_cpp,
+                    f"{remote_compile_dir}/{source_name}",
+                ),
+                self._render_container_adb_push(
+                    f"{container_support_dir}/libharness.h",
+                    f"{remote_compile_dir}/libharness.h",
+                ),
+                self._render_container_adb_push(
+                    f"{container_support_dir}/FuzzedDataProvider.h",
+                    f"{remote_compile_dir}/FuzzedDataProvider.h",
+                ),
+                self._render_container_adb_push(
+                    f"{container_support_dir}/libharness.so",
+                    f"{remote_compile_dir}/libharness.so",
+                ),
+                self._render_container_adb_root(compile_command),
+                self._render_container_adb_root(
+                    f"if [ -f {remote_compile_dir}/{harness_name} ]; then printf exists; else printf missing; fi"
+                ),
+                (
+                    f"docker exec -i {shlex.quote(self.profile.container_name)} "
+                    f"adb -s {shlex.quote(self.profile.device_serial)} pull "
+                    f"{shlex.quote(f'{remote_compile_dir}/{harness_name}')} "
+                    f"{shlex.quote(container_output_path)}"
+                ),
+            ]
+        )
+        compile_result = self._run_remote(script, check=False)
+        if compile_result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                compile_result.returncode,
+                compile_command,
+                output=compile_result.stdout,
+                stderr=compile_result.stderr,
+            )
+        if "exists" not in compile_result.stdout:
+            raise RuntimeError(
+                f"fallback compile did not produce {remote_compile_dir}/{harness_name}"
+            )
+        return subprocess.CompletedProcess(
+            args=["device-compile"],
+            returncode=0,
+            stdout=compile_result.stdout,
+            stderr=compile_result.stderr,
+        )
+
+    def _compile_remote_harness_host(
+        self,
+        host_harness_dir: str,
+        *,
+        debug_build: bool,
+        compile_tag: str,
+    ) -> subprocess.CompletedProcess[str]:
+        compiler_path_text = self.profile.host_compile_cxx.strip()
+        if not compiler_path_text:
+            raise CompileRouteUnavailableError(
+                "No host Android compiler is configured. "
+                "Set host_compile_cxx or use compile_mode=device with a device compiler."
+            )
+        compiler_path = Path(compiler_path_text)
+        if not compiler_path.is_file():
+            raise CompileRouteUnavailableError(
+                f"Configured host Android compiler does not exist: {compiler_path}"
+            )
+
+        strip_path: Path | None = None
+        if self.profile.host_compile_strip.strip():
+            strip_path = Path(self.profile.host_compile_strip.strip())
+            if not strip_path.is_file():
+                raise CompileRouteUnavailableError(
+                    f"Configured host strip tool does not exist: {strip_path}"
+                )
+
+        harness_name = "harness_debug" if debug_build else self.profile.harness_binary_name
+        source_name = f"{harness_name}.cpp"
+        support_dir = str(PurePosixPath(self.profile.host_libharness_path).parent)
+        workspace = self._local_compile_workspace(compile_tag, debug_build=debug_build)
+        if workspace.exists():
+            self._remove_tree(workspace)
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        local_output = workspace / harness_name
+
+        self._download_remote_bundle(
+            {
+                source_name: f"{host_harness_dir}/{source_name}",
+                "libharness.h": f"{support_dir}/libharness.h",
+                "FuzzedDataProvider.h": f"{support_dir}/FuzzedDataProvider.h",
+                "libharness.so": self.profile.host_libharness_path,
+            },
+            workspace,
+        )
+
+        compile_command = self._build_host_compile_command(
+            compiler_path,
+            source_name=source_name,
+            harness_name=harness_name,
+            debug_build=debug_build,
+        )
+        compile_result = self._run_local_command(compile_command, cwd=workspace)
+        if compile_result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                compile_result.returncode,
+                compile_command,
+                output=compile_result.stdout,
+                stderr=compile_result.stderr,
+            )
+        if not local_output.is_file():
+            raise RuntimeError(f"host compile did not produce expected binary: {local_output}")
+
+        strip_stdout = ""
+        strip_stderr = ""
+        if strip_path is not None:
+            strip_command = self._build_host_strip_command(strip_path, local_output)
+            strip_result = self._run_local_command(strip_command, cwd=workspace)
+            if strip_result.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    strip_result.returncode,
+                    strip_command,
+                    output=strip_result.stdout,
+                    stderr=strip_result.stderr,
+                )
+            strip_stdout = strip_result.stdout
+            strip_stderr = strip_result.stderr
+
+        remote_output = f"{host_harness_dir}/{harness_name}"
+        self._upload_local_file(local_output, remote_output)
+        self._run_remote(
+            f"chmod 755 {shlex.quote(remote_output)}",
+            check=True,
+            capture_output=True,
+        )
+
+        stdout_parts = [compile_result.stdout]
+        stderr_parts = [compile_result.stderr]
+        if strip_stdout:
+            stdout_parts.append(strip_stdout)
+        if strip_stderr:
+            stderr_parts.append(strip_stderr)
+        stdout_parts.append(
+            f"[host-compile-workspace] {workspace}\n[uploaded] {remote_output}"
+        )
+        return subprocess.CompletedProcess(
+            args=compile_command,
+            returncode=0,
+            stdout="\n".join(part for part in stdout_parts if part).strip(),
+            stderr="\n".join(part for part in stderr_parts if part).strip(),
+        )
+
+    def _local_compile_workspace(self, compile_tag: str, *, debug_build: bool) -> Path:
+        build_root = self.profile.local_build_path
+        if not build_root.is_absolute():
+            build_root = self.repo_root / build_root
+        compile_kind = "debug" if debug_build else "release"
+        return (
+            build_root
+            / "host_compile"
+            / _sanitize_name(self.profile.name)
+            / compile_kind
+            / _sanitize_name(compile_tag)
+        )
+
+    @staticmethod
+    def _wrap_windows_batch_command(command: list[str]) -> list[str]:
+        if command and Path(command[0]).suffix.lower() in {".cmd", ".bat"}:
+            return ["cmd.exe", "/d", "/c", *command]
+        return command
+
+    def _build_host_compile_command(
+        self,
+        compiler_path: Path,
+        *,
+        source_name: str,
+        harness_name: str,
+        debug_build: bool,
+    ) -> list[str]:
+        command = [str(compiler_path)]
+        if debug_build:
+            command.extend(["-g3", "-O0"])
+        command.extend(
+            [
+                "-std=c++17",
+                "-Wall",
+                "-Wl,--export-dynamic",
+                "-Wl,-rpath,$ORIGIN",
+                source_name,
+                "-L.",
+                "-lharness",
+                "-o",
+                harness_name,
+            ]
+        )
+        return self._wrap_windows_batch_command(command)
+
+    def _build_host_strip_command(self, strip_path: Path, local_output: Path) -> list[str]:
+        return self._wrap_windows_batch_command([str(strip_path), str(local_output)])
 
     def _build_runtime_env(
         self,
@@ -958,6 +1287,10 @@ compile_harness(
         return env_map
 
     def _load_runtime_overrides(self, device_session_root: str) -> dict[str, str]:
+        if self.profile.runtime_overrides_env_text:
+            env_map = self._parse_env_text(self.profile.runtime_overrides_env_text)
+            self._rewrite_env_device_paths(env_map, device_session_root)
+            return env_map
         if not self.profile.host_runtime_overrides_env_path:
             return {}
         try:
@@ -1152,13 +1485,49 @@ print(json.dumps(Path({remote_path!r}).read_text(encoding='utf-8')))
         result = self._run_remote(f"python3 - <<'PY'\n{inline}\nPY", check=True)
         return json.loads(result.stdout)
 
+    def _download_remote_file(self, remote_path: str, local_path: Path):
+        _ensure_parent(local_path)
+        result = self._run_remote_binary(
+            f"cat {shlex.quote(remote_path)}",
+            check=True,
+        )
+        local_path.write_bytes(result.stdout)
+
+    def _download_remote_bundle(self, archive_members: dict[str, str], local_dir: Path):
+        if not archive_members:
+            return
+        local_dir.mkdir(parents=True, exist_ok=True)
+        inline = f"""
+import json
+import sys
+import tarfile
+
+archive_members = json.loads({json.dumps(json.dumps(archive_members))})
+with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
+    for arcname, remote_path in archive_members.items():
+        archive.add(remote_path, arcname=arcname, recursive=False)
+"""
+        result = self._run_remote_binary(
+            f"python3 - <<'PY'\n{inline}\nPY",
+            check=True,
+        )
+        with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as archive:
+            _safe_extract_tar_windows(archive, local_dir)
+
     def _write_remote_file(self, remote_path: str, data: bytes):
         remote_parent = str(PurePosixPath(remote_path).parent)
+        remote_temp = f"{remote_path}.codex_tmp"
         script = (
             f"mkdir -p {shlex.quote(remote_parent)} && "
-            f"cat > {shlex.quote(remote_path)}"
+            f"cat > {shlex.quote(remote_temp)} && "
+            f"mv -f {shlex.quote(remote_temp)} {shlex.quote(remote_path)}"
         )
         self._run_remote_binary(script, check=True, input_bytes=data)
+
+    def _upload_local_file(self, local_path: Path, remote_path: str):
+        if not local_path.is_file():
+            raise FileNotFoundError(local_path)
+        self._write_remote_file(remote_path, local_path.read_bytes())
 
     def _download_remote_tree(self, remote_dir: str, local_dir: Path):
         if local_dir.exists():
@@ -1182,6 +1551,23 @@ print(json.dumps(Path({remote_path!r}).read_text(encoding='utf-8')))
             f"tar -xf - -C {shlex.quote(remote_dir)}"
         )
         self._run_remote_binary(script, check=True, input_bytes=payload.getvalue())
+
+    def _run_local_command(
+        self,
+        command: list[str],
+        *,
+        cwd: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        logger.debug(f"[local] {' '.join(command)}")
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
 
     def _push_remote_file_to_device(self, host_file_path: str, device_path: str):
         device_parent = str(PurePosixPath(device_path).parent)
@@ -1211,6 +1597,16 @@ print(json.dumps(Path({remote_path!r}).read_text(encoding='utf-8')))
             f"docker exec -i {shlex.quote(self.profile.container_name)} "
             f"adb -s {shlex.quote(self.profile.device_serial)} shell "
             f"{shlex.quote(adb_shell_command)}"
+        )
+
+    def _render_container_adb_root(self, device_command: str) -> str:
+        return self._render_container_adb_shell_root(device_command)
+
+    def _render_container_adb_push(self, host_path: str, device_path: str) -> str:
+        return (
+            f"docker exec -i {shlex.quote(self.profile.container_name)} "
+            f"adb -s {shlex.quote(self.profile.device_serial)} push "
+            f"{shlex.quote(host_path)} {shlex.quote(device_path)}"
         )
 
     def _collect_prepare_checks(self) -> dict[str, Any]:
@@ -1413,7 +1809,7 @@ print(json.dumps(result, sort_keys=True))
         self,
         remote_harness_dir: str,
         *,
-        runtime_overrides_path: str,
+        runtime_overrides_text: str,
     ) -> DroidotProfile:
         original_harness_root = PurePosixPath(self.profile.host_harness_dir)
         new_harness_root = PurePosixPath(remote_harness_dir)
@@ -1441,7 +1837,8 @@ print(json.dumps(result, sort_keys=True))
             host_harness_dir=remote_harness_dir,
             host_frida_script=_rewrite_if_under_harness(self.profile.host_frida_script),
             host_seed_dir=_rewrite_if_under_harness(self.profile.host_seed_dir),
-            host_runtime_overrides_env_path=runtime_overrides_path,
+            host_runtime_overrides_env_path="",
+            runtime_overrides_env_text=runtime_overrides_text,
             host_extra_stage_files=staged_files,
         )
 

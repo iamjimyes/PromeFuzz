@@ -22,9 +22,13 @@ Current directory contract:
 - device-side PromeFuzz runs use `/data/local/tmp/promefuzz-bigemu/...`
 - host-side source inputs remain under `/home/psy/droidot/...`
 - local pulled results live under `PromeFuzz/android_runs/promefuzz-bigemu/...`
+- local host-compile staging lives under `PromeFuzz/build/promefuzz-bigemu/...`
 - profile authors may need to set `host_runtime_libcpp_path` when the app's
   bundled `libc++_shared.so` is ABI-incompatible with `droidot`-compiled
   `harness/libharness.so`
+- bigemu profiles should prefer `compile_mode=auto` with a configured
+  `host_compile_cxx` Windows Android NDK compiler so the baseline does not
+  depend on a device-side Termux compiler
 - Windows pullback is normalized rather than filename-preserving because AFL
   queue and crash filenames contain characters invalid on Windows
 
