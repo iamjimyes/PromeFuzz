@@ -220,6 +220,20 @@ class DroidotBaselineRunner:
     """
 
     REPLAY_TIMEOUT_SECONDS = 20
+    BOOTSTRAP_STALL_START_MARKERS = (
+        "[HARNESS] load_art start",
+        "[HARNESS] dlsym JNI_CreateJavaVM",
+        "[HARNESS] calling JNI_CreateJavaVM",
+        "[HARNESS] load_art stage: before JNI_CreateJavaVM",
+    )
+    BOOTSTRAP_STALL_PROGRESS_MARKERS = (
+        "[HARNESS] load_art stage: JNI_CreateJavaVM returned res=",
+        "[HARNESS] load_art stage: before registerFrameworkNatives",
+        "[HARNESS] load_art stage: registerFrameworkNatives returned res=",
+        "[HARNESS] load_art stage: vm/env assigned javaVM=",
+        "[HARNESS] load_art stage: done",
+        "[HARNESS] load_art done",
+    )
 
     def __init__(self, profile: DroidotProfile):
         self.profile = profile
@@ -377,6 +391,11 @@ class DroidotBaselineRunner:
             pre_replay["log"], encoding="utf-8", errors="replace"
         )
         self._write_json(attempt_dir / "pre_replay.summary.json", pre_replay)
+        repair_scope = self._derive_repair_scope(
+            pre_replay["log"],
+            runtime_overrides_meta,
+        )
+        self._write_json(attempt_dir / "repair.scope.json", repair_scope)
 
         repair_prompt = DroidotRepairPrompter(LLMChat(llm_client))
         repair_decision = repair_prompt.prompt(
@@ -385,7 +404,7 @@ class DroidotBaselineRunner:
             harness_code=original_harness_code,
             info_json=info_json_text,
             runtime_overrides_text=runtime_overrides_text,
-            allowed_target_files=self._allowed_repair_targets(runtime_overrides_meta),
+            allowed_target_files=repair_scope["allowed_target_files"],
         )
         self._write_json(attempt_dir / "repair.decision.json", repair_decision)
 
@@ -394,7 +413,7 @@ class DroidotBaselineRunner:
         updated_text = repair_decision.get("updated_file_content", "")
         if (
             verdict not in {"harness_fp", "runtime_setup_fp"}
-            or target_file not in self._allowed_repair_targets(runtime_overrides_meta)
+            or target_file not in repair_scope["allowed_target_files"]
             or not updated_text
         ):
             result = {
@@ -403,6 +422,7 @@ class DroidotBaselineRunner:
                 "attempt_dir": str(attempt_dir),
                 "source_input_path": str(input_path),
                 "pre_replay": pre_replay,
+                "repair_scope": repair_scope,
                 "repair_decision": repair_decision,
             }
             self._write_json(attempt_dir / "repair.result.json", result)
@@ -463,6 +483,7 @@ class DroidotBaselineRunner:
                 "attempt_dir": str(attempt_dir),
                 "source_input_path": str(input_path),
                 "pre_replay": pre_replay,
+                "repair_scope": repair_scope,
                 "repair_decision": repair_decision,
                 "compile_result": compile_result,
                 "verification_error": error_text,
@@ -488,6 +509,7 @@ class DroidotBaselineRunner:
             "attempt_dir": str(attempt_dir),
             "source_input_path": str(input_path),
             "pre_replay": pre_replay,
+            "repair_scope": repair_scope,
             "repair_decision": repair_decision,
             "compile_result": compile_result,
             "post_replay": post_replay,
@@ -1783,6 +1805,56 @@ print(json.dumps(result, sort_keys=True))
             "log": log_path.read_text(encoding="utf-8", errors="replace"),
             "generated_at": summary.get("generated_at", _now_utc()),
             "reused_cached_replay": True,
+        }
+
+    def _derive_repair_scope(
+        self,
+        replay_log: str,
+        runtime_overrides_meta: dict[str, Any],
+    ) -> dict[str, Any]:
+        allowed_target_files = self._allowed_repair_targets(runtime_overrides_meta)
+        heuristic = self._detect_bootstrap_stall(replay_log)
+        narrowed_targets = list(allowed_target_files)
+        if heuristic["detected"] and "harness.cpp" in narrowed_targets:
+            narrowed_targets = [
+                target_file
+                for target_file in narrowed_targets
+                if target_file != "harness.cpp"
+            ]
+        return {
+            "allowed_target_files": narrowed_targets,
+            "base_allowed_target_files": allowed_target_files,
+            "bootstrap_stall_heuristic": heuristic,
+        }
+
+    def _detect_bootstrap_stall(self, replay_log: str) -> dict[str, Any]:
+        replay_text = replay_log or ""
+        replay_text_lower = replay_text.lower()
+        matched_start_markers = [
+            marker for marker in self.BOOTSTRAP_STALL_START_MARKERS if marker in replay_text
+        ]
+        matched_progress_markers = [
+            marker
+            for marker in self.BOOTSTRAP_STALL_PROGRESS_MARKERS
+            if marker in replay_text
+        ]
+        timed_out = (
+            "[replay-returncode] 2" in replay_text
+            and ("timed off" in replay_text_lower or "timed out" in replay_text_lower)
+        )
+        detected = bool(matched_start_markers) and not matched_progress_markers and timed_out
+        return {
+            "detected": detected,
+            "kind": "bootstrap_only_jni_createjavavm_timeout" if detected else "none",
+            "reason": (
+                "Replay timed out while still inside droidot libharness bootstrap before "
+                "JNI_CreateJavaVM completed; restrict repair away from harness.cpp."
+                if detected
+                else ""
+            ),
+            "matched_start_markers": matched_start_markers,
+            "matched_progress_markers": matched_progress_markers,
+            "timed_out": timed_out,
         }
 
     def _materialize_runtime_overrides(self, candidate_workspace: Path) -> dict[str, Any]:

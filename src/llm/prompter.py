@@ -1163,10 +1163,13 @@ class DroidotRepairPrompter(Prompter):
 
     @staticmethod
     def build_repair_rules(allowed_target_files: list[str]) -> list[str]:
+        allowed_target_files_text = (
+            ", ".join(allowed_target_files) if allowed_target_files else "<none>"
+        )
         return [
             "Allowed verdict values: harness_fp, runtime_setup_fp, target_crash, unknown.",
             "Only propose edits when the evidence supports a false positive or setup issue.",
-            "Allowed target files are: " + ", ".join(allowed_target_files) + ".",
+            "Allowed target files are: " + allowed_target_files_text + ".",
             "Return a full replacement file content when target_file is not empty.",
             "If no edit is justified, return target_file as an empty string and updated_file_content as an empty string.",
             "Treat this as a droidot JNI driver repair, not a granzon runtime redesign.",

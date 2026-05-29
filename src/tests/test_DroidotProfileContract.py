@@ -98,6 +98,27 @@ def run():
     assert fake_runner.calls == ["device", "host"], fake_runner.calls
     assert compile_result["compile_route"] == "host", compile_result
     assert compile_result["route_errors"][0]["route"] == "device", compile_result
+
+    replay_log = "\n".join(
+        [
+            "[replay-returncode] 2",
+            "[HARNESS] load_art start",
+            "[HARNESS] dlsym JNI_CreateJavaVM",
+            "[HARNESS] calling JNI_CreateJavaVM",
+            "+++ Program timed off +++",
+        ]
+    )
+    heuristic = runner._detect_bootstrap_stall(replay_log)
+    assert heuristic["detected"] is True, heuristic
+    repair_scope = runner._derive_repair_scope(
+        replay_log,
+        {"candidate_path": Path("runtime_overrides.env"), "remote_path": "/remote/runtime_overrides.env"},
+    )
+    assert repair_scope["base_allowed_target_files"] == [
+        "harness.cpp",
+        "runtime_overrides.env",
+    ], repair_scope
+    assert repair_scope["allowed_target_files"] == ["runtime_overrides.env"], repair_scope
     print("DROIDOT_PROFILE_CONTRACT_OK")
 
 
