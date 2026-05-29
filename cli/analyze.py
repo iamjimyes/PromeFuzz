@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from src.utils import setup_default_config, setup_llm
 from src import vars as global_vars
 from src.analyzer.asan import AsanError
+from src.analyzer.fallback import CrashLogClassifier
 from src.analyzer.report import CrashReportComposer
 from src.preprocessor.information import InfoRepository
 from src.preprocessor.api import APICollection
@@ -91,14 +92,26 @@ def analyze(
     valid_filenames: list[str] = []
     err_signatures: list[str] = []
     asan_errors: list[AsanError] = []
+    fallback_crashes: list[tuple[str, str, str, str]] = []
     TP_crash_signatures: list[str] = []
+    classifier = CrashLogClassifier()
     for crash_file in tqdm(
         crash_files, desc="Parsing crashes", unit="crash", leave=False, colour="yellow"
     ):
+        crash_text = crash_file.read_text(encoding="utf-8", errors="replace")
         try:
-            asan_error = AsanError(crash_file.read_text())
+            asan_error = AsanError(crash_text)
         except Exception as e:
-            logger.debug(f"No crash found for {crash_file}, skipping: {e}")
+            logger.debug(f"ASan parser did not accept {crash_file}: {e}")
+            fallback = classifier.classify(crash_text)
+            fallback_crashes.append(
+                (
+                    crash_file.name,
+                    fallback["signature"],
+                    fallback["kind"],
+                    fallback["summary"],
+                )
+            )
             continue
         if asan_error.signature in err_signatures and not (
             asan_error.signature.endswith("unknown")
@@ -137,6 +150,26 @@ def analyze(
                 output_path / f"{crash_type}-{err_sig.replace('/', '_')}-{filename}.md"
             )
             output_file.write_text(analysis_report)
+        for filename, err_sig, kind, summary in fallback_crashes:
+            crash_type = "FP" if kind == "setup-failure" else "UN"
+            report = "\n".join(
+                [
+                    "# Crash report",
+                    "",
+                    f"- File: `{filename}`",
+                    f"- Kind: `{kind}`",
+                    f"- Signature: `{err_sig}`",
+                    f"- Summary: {summary}",
+                    "",
+                    "# No LLM analysis",
+                    "",
+                    "This log did not match PromeFuzz's standard ASan parser.",
+                ]
+            )
+            (output_path / f"{crash_type}-{err_sig.replace('/', '_')}-{filename}.md").write_text(
+                report,
+                encoding="utf-8",
+            )
         logger.success(f"Analysis reports are saved to {output_path}.")
 
     if task_option == TaskOption.GLANCE.value or task_option == TaskOption.ALL.value:
@@ -157,6 +190,14 @@ def analyze(
             f"{len(library_crashes)} library crashes found:\n"
             + "\n\n".join(library_crashes)
         )
+        if fallback_crashes:
+            logger.warning(
+                "Non-ASan fallback crash logs found:\n"
+                + "\n\n".join(
+                    f"========== {filename}({signature}) ==========\nkind={kind}\n{summary}"
+                    for filename, signature, kind, summary in fallback_crashes
+                )
+            )
         if TP_crashes:
             logger.success(
                 f"{len(TP_crashes)} true positive crashes found:\n"

@@ -113,6 +113,7 @@ If you prefer a native installation, follow these steps:
 PromeFuzz is controlled via the command-line script `PromeFuzz.py`, which supports the following subcommands:
 
 - `configure`: Set the configuration for PromeFuzz.
+- `droidot`: Run the droidot JNI baseline workflow.
 - `preprocess`: Preprocess the library to extract code metadata knowledge.
 - `comprehend`: Comprehend the library using LLM to extract documentation knowledge.
 - `generate`: Generate fuzzing harnesses using the extracted knowledge.
@@ -126,6 +127,25 @@ For detailed usage of each subcommand, run:
 ```
 
 Additionally, a set of [utility scripts](database/utils/README.md) are available in the `database/utils/` directory to assist with common tasks such as fuzzing execution, coverage collection, and result evaluation.
+
+### Droidot JNI Baseline
+
+This repository-local fork also includes a comparative baseline path for existing `droidot` JNI fuzz drivers.
+
+The `droidot` workflow is intentionally separate from the main PromeFuzz C/C++ harness-generation pipeline:
+
+- it consumes an existing remote JNI harness directory
+- it can invoke the remote droidot compile helper when needed
+- it stages the harness to a configured Android lane
+- it runs a bounded AFL session
+- it pulls back crashes and emits lightweight triage summaries
+
+Use the template profile at `profiles/droidot_jni.template.json` and run:
+
+```bash
+./PromeFuzz.py droidot prepare --profile profiles/droidot_jni.template.json
+./PromeFuzz.py droidot run --profile profiles/droidot_jni.template.json --session smoke_001
+```
 
 Below, we walk through a complete example using `pugixml` to demonstrate the end-to-end workflow.
 

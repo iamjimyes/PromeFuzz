@@ -18,6 +18,7 @@ from src import vars as global_vars
 SUBCOMMANDS = (
     # add commands here.
     "configure",
+    "droidot",
     "preprocess",
     "comprehend",
     "generate",
@@ -27,11 +28,25 @@ SUBCOMMANDS = (
 )
 
 
+def _requested_subcommand() -> str | None:
+    """
+    Best-effort detection of the requested subcommand before click parsing.
+    """
+    for arg in sys.argv[1:]:
+        if arg.startswith("-"):
+            continue
+        if arg in SUBCOMMANDS:
+            return arg
+    return None
+
+
 def setup_subcommands():
     """
     Import command-line module and add the right command.
     """
-    for cmd in SUBCOMMANDS:
+    requested = _requested_subcommand()
+    command_list = (requested,) if requested else SUBCOMMANDS
+    for cmd in command_list:
         module = importlib.import_module(f"cli.{cmd}")
         method = getattr(module, cmd)
         butler.add_command(method)
@@ -52,7 +67,10 @@ def setup_logger(debug: bool):
         colorize=True,
     )
     Path("logs").mkdir(exist_ok=True)
-    log_filename = f"logs/{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{"_".join(sys.argv).replace(' ', '_').replace('/', '_')}.log"
+    argv_str = "_".join(sys.argv).replace(" ", "_").replace("/", "_").replace("\\", "_")
+    log_filename = (
+        f"logs/{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{argv_str}.log"
+    )
     if len(log_filename) > 255:
         log_filename = log_filename[:200] + ".log"
     logger.add(
@@ -79,7 +97,7 @@ def load_config(config_path: Path, library_path: Path):
         logger.debug("Help flag detected; skipping configuration loading.")
         return
 
-    if click.get_current_context().invoked_subcommand == "configure":
+    if click.get_current_context().invoked_subcommand in {"configure", "droidot"}:
         global_vars.config = {}
         global_vars.config_template = {}
         global_vars.libraries = {}
