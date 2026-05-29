@@ -36,3 +36,4 @@ library/
 /*.json
 /test*
 report-*.md
+android_runs/
