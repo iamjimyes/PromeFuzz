@@ -1161,6 +1161,34 @@ class DroidotRepairPrompter(Prompter):
         self.system_prompt = ""
         self.user_prompt = ""
 
+    @staticmethod
+    def build_repair_rules(allowed_target_files: list[str]) -> list[str]:
+        return [
+            "Allowed verdict values: harness_fp, runtime_setup_fp, target_crash, unknown.",
+            "Only propose edits when the evidence supports a false positive or setup issue.",
+            "Allowed target files are: " + ", ".join(allowed_target_files) + ".",
+            "Return a full replacement file content when target_file is not empty.",
+            "If no edit is justified, return target_file as an empty string and updated_file_content as an empty string.",
+            "Treat this as a droidot JNI driver repair, not a granzon runtime redesign.",
+            "In droidot, harness.cpp should only control stdin consumption, input-to-JNI argument decoding, JNI API call order, caller-object preparation, and the final target JNI invocation.",
+            "In droidot, libharness.so owns ART/JNI bootstrap such as load_art, env, CallerObj0, targetLibBase, JNI_CreateJavaVM, and registerFrameworkNatives.",
+            "Do not propose classes.dex, libjenv.so, granzon-only helpers, or any file outside the allowed target files.",
+            "If replay stalls before the target JNI call and the log only shows load_art or JNI_CreateJavaVM progress, do not rewrite harness.cpp unless the harness code itself shows a concrete bug such as not reading stdin, corrupting the API sequence, or skipping the target call.",
+            "Use runtime_setup_fp only for issues that can plausibly be fixed within the provided runtime_overrides.env knobs; otherwise prefer analysis without edits.",
+        ]
+
+    @staticmethod
+    def build_repair_contract_note() -> str:
+        return "\n".join(
+            [
+                "droidot repair contract:",
+                "- Keep fixes inside the existing droidot driver contract.",
+                "- Prefer repairs to input placement, API sequence, caller-object handling, and target-call gating.",
+                "- Treat JVM/bootstrap internals as libharness-owned runtime, not as harness.cpp logic.",
+                "- Do not invent granzon migration work or new runtime artifacts.",
+            ]
+        )
+
     def prompt(
         self,
         replay_log: str,
@@ -1170,13 +1198,7 @@ class DroidotRepairPrompter(Prompter):
         runtime_overrides_text: str,
         allowed_target_files: list[str],
     ) -> dict[str, str]:
-        rules = [
-            "Allowed verdict values: harness_fp, runtime_setup_fp, target_crash, unknown.",
-            "Only propose edits when the evidence supports a false positive or setup issue.",
-            "Allowed target files are: " + ", ".join(allowed_target_files) + ".",
-            "Return a full replacement file content when target_file is not empty.",
-            "If no edit is justified, return target_file as an empty string and updated_file_content as an empty string.",
-        ]
+        rules = self.build_repair_rules(allowed_target_files)
         output_contract = {
             "kind": "droidot_repair",
             "verdict": "harness_fp",
@@ -1197,6 +1219,7 @@ class DroidotRepairPrompter(Prompter):
                 "inputs/runtime_overrides.env",
                 runtime_overrides_text or "# no runtime_overrides.env\n",
             ),
+            ("inputs/droidot_contract.txt", self.build_repair_contract_note()),
         ]
 
         if self.use_exec_tasks:
@@ -1231,6 +1254,9 @@ class DroidotRepairPrompter(Prompter):
                 "Current info.json:\n```json\n" + info_json + "\n```",
                 "Current runtime_overrides.env:\n```text\n"
                 + (runtime_overrides_text or "# no runtime_overrides.env\n")
+                + "\n```",
+                "droidot repair contract:\n```text\n"
+                + self.build_repair_contract_note()
                 + "\n```",
                 "Respond with one JSON object matching this schema:\n```json\n"
                 + json.dumps(output_contract, indent=2)
