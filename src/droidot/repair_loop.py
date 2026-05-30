@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -63,6 +64,53 @@ def _append_jsonl(path: Path, payload: dict):
         fh.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
 
+def _is_retryable_remote_error(exc: BaseException) -> bool:
+    if isinstance(exc, subprocess.CalledProcessError):
+        stderr = exc.stderr
+        if isinstance(stderr, bytes):
+            stderr_text = stderr.decode("utf-8", errors="replace")
+        else:
+            stderr_text = str(stderr or "")
+        stdout = exc.output
+        if isinstance(stdout, bytes):
+            stdout_text = stdout.decode("utf-8", errors="replace")
+        else:
+            stdout_text = str(stdout or "")
+        combined = f"{stdout_text}\n{stderr_text}".lower()
+        return exc.returncode == 255 or "connection timed out" in combined or "ssh:" in combined
+    return False
+
+
+def _failure_record(
+    round_idx: int,
+    elapsed_seconds: float,
+    exc: BaseException,
+) -> dict:
+    stderr_text = ""
+    stdout_text = ""
+    returncode = None
+    if isinstance(exc, subprocess.CalledProcessError):
+        returncode = exc.returncode
+        if isinstance(exc.stderr, bytes):
+            stderr_text = exc.stderr.decode("utf-8", errors="replace")
+        else:
+            stderr_text = str(exc.stderr or "")
+        if isinstance(exc.output, bytes):
+            stdout_text = exc.output.decode("utf-8", errors="replace")
+        else:
+            stdout_text = str(exc.output or "")
+    return {
+        "round": round_idx,
+        "elapsed_seconds": elapsed_seconds,
+        "status": "remote_retryable_failure",
+        "error_type": type(exc).__name__,
+        "returncode": returncode,
+        "error": str(exc),
+        "stderr": stderr_text,
+        "stdout": stdout_text,
+    }
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", required=True)
@@ -115,7 +163,27 @@ def main() -> int:
                 session_name,
             )
             started_at = time.time()
-            result = runner.repair_input(session_name, input_path, llm_client)
+            try:
+                result = runner.repair_input(session_name, input_path, llm_client)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                elapsed = time.time() - started_at
+                if _is_retryable_remote_error(exc):
+                    failure = _failure_record(round_idx, elapsed, exc)
+                    _append_jsonl(loop_log_path, failure)
+                    logger.warning(
+                        "droidot repair loop round={} hit retryable remote failure; "
+                        "sleeping {}s before retry.\n{}",
+                        round_idx,
+                        max(args.sleep_seconds, 0.0),
+                        failure["error"],
+                    )
+                    if args.rounds < 0 or round_idx < args.rounds:
+                        time.sleep(max(args.sleep_seconds, 0.0))
+                        continue
+                    break
+                raise
             elapsed = time.time() - started_at
             loop_record = {
                 "round": round_idx,

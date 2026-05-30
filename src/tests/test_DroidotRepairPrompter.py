@@ -50,6 +50,7 @@ def run():
         assert "JNI_CreateJavaVM" in joined_rules, joined_rules
         assert "libharness.so owns ART/JNI bootstrap" in joined_rules, joined_rules
         assert "Do not propose classes.dex, libjenv.so, granzon-only helpers" in joined_rules, joined_rules
+        assert "do not change caller-only knobs such as DROIDOT_ALLOW_NULL_CALLER" in joined_rules, joined_rules
         contract_note = DroidotRepairPrompter.build_repair_contract_note()
         assert "Treat JVM/bootstrap internals as libharness-owned runtime" in contract_note, contract_note
         print("DROIDOT_REPAIR_PROMPTER_OK")

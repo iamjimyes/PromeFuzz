@@ -1177,6 +1177,7 @@ class DroidotRepairPrompter(Prompter):
             "In droidot, libharness.so owns ART/JNI bootstrap such as load_art, env, CallerObj0, targetLibBase, JNI_CreateJavaVM, and registerFrameworkNatives.",
             "Do not propose classes.dex, libjenv.so, granzon-only helpers, or any file outside the allowed target files.",
             "If replay stalls before the target JNI call and the log only shows load_art or JNI_CreateJavaVM progress, do not rewrite harness.cpp unless the harness code itself shows a concrete bug such as not reading stdin, corrupting the API sequence, or skipping the target call.",
+            "If replay never reaches post-bootstrap harness flow, do not change caller-only knobs such as DROIDOT_ALLOW_NULL_CALLER or DROIDOT_CLASS0_OVERRIDE unless the log shows the failure already progressed past JNI_CreateJavaVM and class materialization.",
             "Use runtime_setup_fp only for issues that can plausibly be fixed within the provided runtime_overrides.env knobs; otherwise prefer analysis without edits.",
         ]
 
