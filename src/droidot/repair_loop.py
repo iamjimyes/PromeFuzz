@@ -85,6 +85,8 @@ def _failure_record(
     round_idx: int,
     elapsed_seconds: float,
     exc: BaseException,
+    *,
+    phase: str,
 ) -> dict:
     stderr_text = ""
     stdout_text = ""
@@ -103,12 +105,31 @@ def _failure_record(
         "round": round_idx,
         "elapsed_seconds": elapsed_seconds,
         "status": "remote_retryable_failure",
+        "phase": phase,
         "error_type": type(exc).__name__,
         "returncode": returncode,
         "error": str(exc),
         "stderr": stderr_text,
         "stdout": stdout_text,
     }
+
+
+def _find_latest_pending_local_attempt(session_dir: Path) -> Path | None:
+    repairs_root = session_dir / "repair_attempts"
+    if not repairs_root.is_dir():
+        return None
+    attempt_dirs = sorted(repairs_root.glob("attempt_*"))
+    for attempt_dir in reversed(attempt_dirs):
+        result_path = attempt_dir / "repair.result.json"
+        if not result_path.is_file():
+            continue
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if result.get("status") == "proposed_local_patch":
+            return attempt_dir
+    return None
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -119,6 +140,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rounds", type=int, default=-1)
     parser.add_argument("--sleep-seconds", type=float, default=2.0)
     parser.add_argument("--stop-on-verified", action="store_true")
+    parser.add_argument("--remote-sync-interval-seconds", type=float, default=900.0)
+    parser.add_argument("--refresh-remote-cache", action="store_true")
     parser.add_argument("--model", default="gpt-5.3-codex")
     parser.add_argument("--codex-executable", default="codex")
     parser.add_argument("--codex-work-root", default="logs/codex_tasks")
@@ -151,6 +174,7 @@ def main() -> int:
     session_dir = runner._local_session_dir(session_name)
     session_dir.mkdir(parents=True, exist_ok=True)
     loop_log_path = session_dir / "repair_loop.history.jsonl"
+    last_remote_sync_started_at = time.time()
 
     round_idx = 0
     try:
@@ -163,14 +187,51 @@ def main() -> int:
                 session_name,
             )
             started_at = time.time()
+            pending_attempt_dir = _find_latest_pending_local_attempt(session_dir)
+            now = time.time()
+            sync_due = (
+                pending_attempt_dir is not None
+                and now - last_remote_sync_started_at >= max(args.remote_sync_interval_seconds, 0.0)
+            )
             try:
-                result = runner.repair_input(session_name, input_path, llm_client)
+                if pending_attempt_dir is not None and not sync_due:
+                    wait_seconds = max(
+                        args.remote_sync_interval_seconds - (now - last_remote_sync_started_at),
+                        0.0,
+                    )
+                    result = {
+                        "status": "waiting_remote_sync",
+                        "attempt_dir": str(pending_attempt_dir),
+                        "patched_target_file": "",
+                        "repair_scope": {},
+                        "repair_decision": {},
+                        "wait_seconds": wait_seconds,
+                    }
+                elif pending_attempt_dir is not None and sync_due:
+                    last_remote_sync_started_at = time.time()
+                    result = runner.verify_repair_attempt(
+                        session_name,
+                        pending_attempt_dir,
+                        input_path,
+                    )
+                else:
+                    result = runner.repair_input_local_only(
+                        session_name,
+                        input_path,
+                        llm_client,
+                        refresh_remote_cache=args.refresh_remote_cache and round_idx == 1,
+                    )
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
                 elapsed = time.time() - started_at
                 if _is_retryable_remote_error(exc):
-                    failure = _failure_record(round_idx, elapsed, exc)
+                    failure = _failure_record(
+                        round_idx,
+                        elapsed,
+                        exc,
+                        phase="remote_sync" if pending_attempt_dir is not None else "local_prepare",
+                    )
                     _append_jsonl(loop_log_path, failure)
                     logger.warning(
                         "droidot repair loop round={} hit retryable remote failure; "
@@ -194,7 +255,11 @@ def main() -> int:
                 "repair_scope": result.get("repair_scope", {}),
                 "repair_decision": result.get("repair_decision", {}),
             }
+            if "wait_seconds" in result:
+                loop_record["wait_seconds"] = result["wait_seconds"]
             _append_jsonl(loop_log_path, loop_record)
+            if result.get("status") == "proposed_local_patch":
+                last_remote_sync_started_at = time.time()
             logger.info(
                 "droidot repair loop round={} status={} patched_target_file={}",
                 round_idx,

@@ -353,21 +353,48 @@ class DroidotBaselineRunner:
         input_path: Path,
         llm_client,
     ) -> dict[str, Any]:
+        local_result = self.repair_input_local_only(
+            session_name,
+            input_path,
+            llm_client,
+            refresh_remote_cache=True,
+        )
+        if local_result.get("status") != "proposed_local_patch":
+            return local_result
+        attempt_dir = Path(local_result["attempt_dir"])
+        return self.verify_repair_attempt(session_name, attempt_dir, input_path)
+
+    def repair_input_local_only(
+        self,
+        session_name: str,
+        input_path: Path,
+        llm_client,
+        *,
+        refresh_remote_cache: bool = False,
+    ) -> dict[str, Any]:
         from src.llm.llm import LLMChat
         from src.llm.prompter import DroidotRepairPrompter
 
-        self.prepare_existing()
         session_dir = self._local_session_dir(session_name)
         session_dir.mkdir(parents=True, exist_ok=True)
-        attempt_dir = self._new_repair_attempt_dir(session_dir)
-
         input_bytes = input_path.read_bytes()
+        self._prepare_repair_session_cache(
+            session_name,
+            input_path,
+            input_bytes=input_bytes,
+            refresh_remote_cache=refresh_remote_cache,
+        )
+        attempt_dir = self._new_repair_attempt_dir(session_dir)
         local_input_copy = attempt_dir / "input.bin"
         local_input_copy.write_bytes(input_bytes)
 
         original_workspace = attempt_dir / "original_harness"
         candidate_workspace = attempt_dir / "candidate_harness"
-        self._download_remote_tree(self.profile.host_harness_dir, original_workspace)
+        shutil.copytree(
+            self._repair_cache_original_harness_dir(session_dir),
+            original_workspace,
+            dirs_exist_ok=True,
+        )
         shutil.copytree(original_workspace, candidate_workspace, dirs_exist_ok=True)
 
         runtime_overrides_meta = self._materialize_runtime_overrides(candidate_workspace)
@@ -446,6 +473,42 @@ class DroidotBaselineRunner:
         )
         (attempt_dir / "candidate.diff").write_text(diff_text, encoding="utf-8")
 
+        result = {
+            "status": "proposed_local_patch",
+            "session_name": session_name,
+            "attempt_dir": str(attempt_dir),
+            "source_input_path": str(input_path),
+            "pre_replay": pre_replay,
+            "repair_scope": repair_scope,
+            "repair_decision": repair_decision,
+            "patched_target_file": target_file,
+        }
+        self._write_json(attempt_dir / "repair.result.json", result)
+        return result
+
+    def verify_repair_attempt(
+        self,
+        session_name: str,
+        attempt_dir: Path,
+        input_path: Path,
+    ) -> dict[str, Any]:
+        session_dir = self._local_session_dir(session_name)
+        input_bytes = input_path.read_bytes()
+        result_path = attempt_dir / "repair.result.json"
+        if not result_path.is_file():
+            raise FileNotFoundError(result_path)
+        local_result = json.loads(result_path.read_text(encoding="utf-8"))
+        repair_decision = local_result.get("repair_decision", {})
+        repair_scope = local_result.get("repair_scope", {})
+        pre_replay = local_result.get("pre_replay", {})
+        target_file = repair_decision.get("target_file", "")
+        candidate_workspace = attempt_dir / "candidate_harness"
+        if not candidate_workspace.is_dir():
+            raise FileNotFoundError(candidate_workspace)
+        runtime_overrides_meta = self._materialize_runtime_overrides(candidate_workspace)
+        target_local_path = candidate_workspace / target_file
+        if target_file == "runtime_overrides.env" and runtime_overrides_meta["candidate_path"]:
+            target_local_path = runtime_overrides_meta["candidate_path"]
         remote_harness_dir = self._remote_repair_harness_dir(session_name, attempt_dir.name)
         self._upload_local_tree(candidate_workspace, remote_harness_dir)
         compile_result = self._compile_remote_harness(
@@ -519,6 +582,100 @@ class DroidotBaselineRunner:
         }
         self._write_json(attempt_dir / "repair.result.json", result)
         return result
+
+    def _prepare_repair_session_cache(
+        self,
+        session_name: str,
+        input_path: Path,
+        *,
+        input_bytes: bytes | None = None,
+        refresh_remote_cache: bool,
+    ):
+        session_dir = self._local_session_dir(session_name)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        if input_bytes is None:
+            input_bytes = input_path.read_bytes()
+        (session_dir / "replay.input").write_bytes(input_bytes)
+
+        cache_harness_dir = self._repair_cache_original_harness_dir(session_dir)
+        self._hydrate_cached_original_harness_from_attempts(session_dir, cache_harness_dir)
+        if refresh_remote_cache or not cache_harness_dir.is_dir():
+            self.prepare_existing()
+            self._download_remote_tree(self.profile.host_harness_dir, cache_harness_dir)
+
+        if self._load_cached_replay(session_dir, input_bytes) is None:
+            self._hydrate_cached_replay_from_attempts(session_dir, input_bytes)
+        if self._load_cached_replay(session_dir, input_bytes) is None:
+            self.prepare_existing()
+            replay = self._run_single_replay(
+                f"{session_name}_cached_pre",
+                input_bytes,
+            )
+            self._write_cached_replay(session_dir, input_path, replay)
+
+    @staticmethod
+    def _repair_cache_original_harness_dir(session_dir: Path) -> Path:
+        return session_dir / "repair_cache" / "original_harness"
+
+    def _hydrate_cached_original_harness_from_attempts(
+        self,
+        session_dir: Path,
+        cache_harness_dir: Path,
+    ):
+        if cache_harness_dir.is_dir():
+            return
+        attempt_dirs = sorted((session_dir / "repair_attempts").glob("attempt_*"))
+        for attempt_dir in reversed(attempt_dirs):
+            original_workspace = attempt_dir / "original_harness"
+            if original_workspace.is_dir():
+                shutil.copytree(original_workspace, cache_harness_dir, dirs_exist_ok=True)
+                return
+
+    def _hydrate_cached_replay_from_attempts(
+        self,
+        session_dir: Path,
+        input_bytes: bytes,
+    ):
+        summary_path = session_dir / "replay.summary.json"
+        log_path = session_dir / "replay.log"
+        input_path = session_dir / "replay.input"
+        attempt_dirs = sorted((session_dir / "repair_attempts").glob("attempt_*"))
+        for attempt_dir in reversed(attempt_dirs):
+            attempt_input = attempt_dir / "input.bin"
+            attempt_summary = attempt_dir / "pre_replay.summary.json"
+            attempt_log = attempt_dir / "pre_replay.log"
+            if not (
+                attempt_input.is_file()
+                and attempt_summary.is_file()
+                and attempt_log.is_file()
+            ):
+                continue
+            if attempt_input.read_bytes() != input_bytes:
+                continue
+            shutil.copyfile(attempt_input, input_path)
+            shutil.copyfile(attempt_summary, summary_path)
+            shutil.copyfile(attempt_log, log_path)
+            return
+
+    def _write_cached_replay(
+        self,
+        session_dir: Path,
+        source_input_path: Path,
+        replay: dict[str, Any],
+    ):
+        log_path = session_dir / "replay.log"
+        log_path.write_text(replay["log"], encoding="utf-8", errors="replace")
+        summary = {
+            "profile_name": self.profile.name,
+            "session_name": replay.get("session_name", session_dir.name),
+            "device_session_root": replay["device_session_root"],
+            "local_session_dir": str(session_dir),
+            "classification": replay["classification"],
+            "replay_log_path": str(log_path),
+            "source_input_path": str(source_input_path),
+            "generated_at": replay.get("generated_at", _now_utc()),
+        }
+        self._write_json(session_dir / "replay.summary.json", summary)
 
     def pull_and_normalize(
         self,
